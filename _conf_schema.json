@@ -1,0 +1,7 @@
+{
+  "cooldown_period": {
+    "description": "发猪图片CD",
+    "type": "int",
+    "default": 5
+  }
+}

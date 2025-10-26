@@ -1,9 +1,4 @@
-# helloworld
+# PigRandomImagePlugin
+## 作者：SakuraMikku
 
-AstrBot 插件模板
-
-A template plugin for AstrBot plugin feature
-
-# 支持
-
-[帮助文档](https://astrbot.app)
+基于图片地址pighub.top
