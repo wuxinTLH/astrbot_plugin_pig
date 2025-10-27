@@ -1,5 +1,5 @@
 name: astrbot_plugin_pig # 这是你的插件的唯一识别名。
-desc: 随机发送猪相关图片 # 插件简短描述
+desc: 随机发送一张猪猪表情包 # 插件简短描述
 version: v0.0.1 # 插件版本号。格式：v1.1.1 或者 v1.1
 author: SakuraMikku # 作者
 repo: https://github.com/wuxinTLH/astrbot_plugin_pig # 插件的仓库地址
