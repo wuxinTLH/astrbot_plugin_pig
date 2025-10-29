@@ -1,7 +1,12 @@
 {
   "cooldown_period": {
-    "description": "发猪图片CD",
+    "description": "发猪图片CD（单位：秒）",
     "type": "int",
     "default": 5
+  },
+  "load_to_local": {
+    "description": "是否将图片加载到本地（true=本地优先，false=仅网络）",
+    "type": "bool",
+    "default": false
   }
 }
