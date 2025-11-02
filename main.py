@@ -12,7 +12,7 @@ from astrbot.api import AstrBotConfig, logger
 from astrbot.core.utils.io import download_image_by_url
 
 
-@register("astrbot_plugin_pig", "SakuraMikku", "随机发送猪相关图片", "0.0.3")
+@register("astrbot_plugin_pig", "SakuraMikku", "随机发送猪相关图片", "0.0.4")
 class PigRandomImagePlugin(Star):
     def __init__(self, context: Context, config: AstrBotConfig):
         super().__init__(context, config)
@@ -76,13 +76,13 @@ class PigRandomImagePlugin(Star):
                     "filename": img_filename
                 })
             
-            logger.info(f"图片配置加载成功，共{len(self.pig_images)}张图片（v0.0.3，无PIL依赖）")
+            logger.info(f"图片配置加载成功，共{len(self.pig_images)}张图片（v0.0.4，无PIL依赖）")
         
         except Exception as e:
             logger.error(f"加载list.json失败：{e}", exc_info=True)
 
     async def initialize(self):
-        logger.info("猪图插件（v0.0.3，无PIL依赖）初始化完成，发送/pig获取图片")
+        logger.info("猪图插件（v0.0.4，无PIL依赖）初始化完成，发送/pig获取图片")
         logger.info(f"当前配置：冷却时间{self.cooldown_period}秒 | 本地加载{self.load_to_local}")
 
     def _is_on_cooldown(self, command_name: str) -> tuple[bool, float]:
@@ -184,8 +184,9 @@ class PigRandomImagePlugin(Star):
 
     @filter.command("pig")
     async def pig_command(self, event: AstrMessageEvent):
+        """/pig 随机发送一张猪猪表情包"""
         async for result in self._get_random_pig_image(event):
             yield result
 
     async def terminate(self):
-        logger.info("猪图插件（v0.0.3，无PIL依赖）已卸载")
+        logger.info("猪图插件（v0.0.4，无PIL依赖）已卸载")
