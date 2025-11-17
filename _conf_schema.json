@@ -8,5 +8,10 @@
     "description": "是否将图片加载到本地（true=本地优先，false=仅网络）",
     "type": "bool",
     "default": false
+  },
+  "update_cycle":{
+    "description":"基于天数更新(1为每天零点更新,0为不更新)",
+    "type":"int",
+    "default":0
   }
 }

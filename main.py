@@ -5,7 +5,7 @@ import os
 import random
 import shutil
 import urllib.parse
-import aiohttp  # 新增：用于异步网络请求
+import aiohttp
 
 from astrbot.api.event import filter, AstrMessageEvent
 from astrbot.api.star import Context, Star, register
@@ -13,7 +13,7 @@ from astrbot.api import AstrBotConfig, logger
 from astrbot.core.utils.io import download_image_by_url
 
 
-@register("astrbot_plugin_pig", "SakuraMikku", "随机发送猪相关图片", "0.0.6")  # 版本号更新
+@register("astrbot_plugin_pig", "SakuraMikku", "随机发送猪相关图片", "0.0.7") 
 class PigRandomImagePlugin(Star):
     def __init__(self, context: Context, config: AstrBotConfig):
         super().__init__(context, config)
@@ -28,14 +28,26 @@ class PigRandomImagePlugin(Star):
         except Exception:
             self.max_retries = 2
 
+        # 新增：更新周期（按天），0 表示不自动更新，1 表示每天零点更新
+        try:
+            self.update_cycle = int(config.get("update_cycle", 0))
+            if self.update_cycle < 0:
+                self.update_cycle = 0
+        except Exception:
+            self.update_cycle = 0
+
         self.last_called_times = {}
         self.pig_images = []
+        # 使用 os.path 保持与原 import 一致
         base_dir = os.path.dirname(__file__)
         self.local_img_dir = os.path.join(base_dir, "imgs", "pig")
         self.json_path = os.path.join(base_dir, "list.json")  # 提取JSON路径为实例变量
 
         # 并发下载限制，避免资源耗尽
         self._download_semaphore = asyncio.Semaphore(3)
+
+        # 后台调度任务句柄
+        self._scheduler_task = None
 
         self._create_local_dir()
         # 初始化时先加载本地数据，后续在initialize中可能更新
@@ -54,11 +66,6 @@ class PigRandomImagePlugin(Star):
     def _sanitize_filename(self, name: str, default: str = "image") -> str:
         """
         清理文件名，防止路径穿越与包含非法字符。
-        规则：
-          - 去除空字符
-          - 替换路径分隔符为下划线
-          - 仅保留常见安全字符（字母数字、部分符号、中文）
-          - 限制长度
         """
         if not name:
             name = default
@@ -69,19 +76,15 @@ class PigRandomImagePlugin(Star):
         allowed = set("-_.() ")
         cleaned_chars = []
         for ch in name:
-            # 保留 ASCII 字母数字
             if ch.isalnum() or ch in allowed:
                 cleaned_chars.append(ch)
                 continue
-            # 保留常见中文字符（简单判断中文范围）
             o = ord(ch)
             if 0x4e00 <= o <= 0x9fff:
                 cleaned_chars.append(ch)
                 continue
-            # 其他一律替换为下划线
             cleaned_chars.append("_")
         cleaned = "".join(cleaned_chars).strip()
-        # 限制长度
         MAX_LEN = 200
         if len(cleaned) > MAX_LEN:
             cleaned = cleaned[:MAX_LEN]
@@ -140,7 +143,6 @@ class PigRandomImagePlugin(Star):
 
             try:
                 parsed = urllib.parse.urlparse(unencoded_url)
-                # 对 path 的每个 segment 单独编码，避免把 '/' 编码掉
                 encoded_path = self._quote_path_preserving_slashes(parsed.path)
                 encoded_full_url = urllib.parse.urlunparse(
                     (parsed.scheme, parsed.netloc, encoded_path, parsed.params, parsed.query, parsed.fragment)
@@ -155,13 +157,11 @@ class PigRandomImagePlugin(Star):
                 img_filename = self._sanitize_filename(str(img_filename))
             else:
                 file_ext = os.path.splitext(thumbnail)[-1] or ".jpg"
-                # 确保 ext 看起来像图片后缀（简单判断）
                 if not file_ext or "." not in file_ext:
                     file_ext = ".jpg"
                 title_part = img.get("title", "未知图片")
                 img_filename = self._sanitize_filename(f"{title_part}{file_ext}")
 
-            # 若后缀仍然不在允许范围，则追加 .jpg
             valid_suffixes = (".jpg", ".jpeg", ".png", ".gif", ".bmp")
             if not img_filename.lower().endswith(valid_suffixes):
                 img_filename = img_filename + ".jpg"
@@ -173,7 +173,7 @@ class PigRandomImagePlugin(Star):
                 "id": img.get("id")
             })
 
-        logger.info(f"图片配置加载成功，共{len(self.pig_images)}张图片（v0.0.5，支持远程更新）")
+        logger.info(f"图片配置加载成功，共{len(self.pig_images)}张图片（v0.0.7，支持远程更新）")
 
     async def _fetch_remote_images(self):
         """从远程接口获取最新图片列表"""
@@ -189,60 +189,95 @@ class PigRandomImagePlugin(Star):
             logger.error(f"远程请求异常：{str(e)}")
             return None
 
+    def _apply_remote_data_if_needed(self, remote_data):
+        """
+        比较远程数据与本地 list.json，必要时原子写入并重新加载。
+        返回 True 表示执行了更新，False 表示未更新或失败。
+        """
+        if not isinstance(remote_data, dict):
+            return False
+
+        local_data = None
+        if os.path.exists(self.json_path):
+            try:
+                with open(self.json_path, "r", encoding="utf-8") as f:
+                    local_data = json.load(f)
+            except Exception:
+                local_data = None
+
+        def extract_ids(d):
+            if not d or not isinstance(d, dict):
+                return set()
+            imgs = d.get("images")
+            if not imgs or not isinstance(imgs, list):
+                return set()
+            return {item.get("id") for item in imgs if isinstance(item, dict) and "id" in item}
+
+        local_ids = extract_ids(local_data)
+        remote_ids = extract_ids(remote_data)
+
+        need_update = False
+        if not local_data:
+            need_update = True
+        else:
+            if local_ids != remote_ids or len(local_data.get("images", [])) != len(remote_data.get("images", [])):
+                need_update = True
+
+        if not need_update:
+            return False
+
+        # 原子写入：写临时文件后 replace
+        tmp_path = f"{self.json_path}.tmp_{int(time.time())}_{random.randint(0, 10**9)}"
+        try:
+            with open(tmp_path, "w", encoding="utf-8") as f:
+                json.dump(remote_data, f, ensure_ascii=False, indent=2)
+            os.replace(tmp_path, self.json_path)
+            logger.info("本地list.json已更新（远程变化），已保存到 %s", self.json_path)
+            # 重新加载内存数据
+            self._load_pig_from_json()
+            return True
+        except Exception as e:
+            logger.error("更新本地 list.json 失败（已记录）。")
+            logger.debug("更新 list.json 失败详情：%s", e)
+            try:
+                if os.path.exists(tmp_path):
+                    os.remove(tmp_path)
+            except Exception:
+                pass
+            return False
+
     async def initialize(self):
-        # 1. 尝试获取远程数据并更新本地文件
+        """
+        初始化：尝试一次性从远程获取并更新本地 list.json（如果需要）。
+        同时根据 update_cycle 启动后台调度器（若配置 > 0）。
+        """
         remote_data = await self._fetch_remote_images()
         if remote_data:
             try:
-                # 2. 读取本地文件进行对比
-                local_data = None
-                if os.path.exists(self.json_path):
-                    try:
-                        with open(self.json_path, "r", encoding="utf-8") as f:
-                            local_data = json.load(f)
-                    except Exception:
-                        local_data = None
-
-                # 3. 基于图片ID集合判断是否需要更新（忽略顺序差异）
-                need_update = False
-                if not local_data:
-                    need_update = True
+                updated = self._apply_remote_data_if_needed(remote_data)
+                if updated:
+                    logger.info("初始化时已从远程更新本地列表")
                 else:
-                    local_ids = {img.get("id") for img in local_data.get("images", []) if isinstance(img, dict) and "id" in img}
-                    remote_ids = {img.get("id") for img in remote_data.get("images", []) if isinstance(img, dict) and "id" in img}
-                    need_update = (local_ids != remote_ids) or (
-                        len(local_data.get("images", [])) != len(remote_data.get("images", []))
-                    )
-
-                # 4. 执行更新（原子替换临时文件）
-                if need_update:
-                    # 生成一个唯一临时文件名（与 tempfile 等价但不新增 import）
-                    tmp_path = f"{self.json_path}.tmp_{int(time.time())}_{random.randint(0, 10**9)}"
-                    try:
-                        with open(tmp_path, "w", encoding="utf-8") as f:
-                            json.dump(remote_data, f, ensure_ascii=False, indent=2)
-                        # 原子替换（在同一文件系统下有效）
-                        os.replace(tmp_path, self.json_path)
-                        added_or_removed = abs(len({img.get("id") for img in remote_data.get("images", []) if isinstance(img, dict)}) - len({img.get("id") for img in (local_data.get("images", []) if isinstance(local_data, dict) else []) if isinstance(img, dict)}))
-                        logger.info(f"本地list.json已更新，新增/移除图片 {added_or_removed} 张")
-                        # 更新后重新加载数据
-                        self._load_pig_from_json()
-                    except Exception as e:
-                        logger.error(f"写入本地list.json失败：{e}")
-                        # 如果临时文件存在，尝试移除
-                        try:
-                            if os.path.exists(tmp_path):
-                                os.remove(tmp_path)
-                        except Exception:
-                            pass
-                else:
-                    logger.info("本地list.json与远程数据一致，无需更新")
-
+                    logger.info("本地list.json与远程数据一致，无需更新（初始化检查）")
             except Exception as e:
                 logger.error(f"处理远程数据时出错：{str(e)}")
 
-        logger.info("猪图插件（v0.0.5，支持远程更新）初始化完成，发送/pig获取图片")
-        logger.info(f"当前配置：冷却时间{self.cooldown_period}秒 | 本地加载{self.load_to_local}")
+        # 启动调度器（仅当 update_cycle > 0）
+        if self.update_cycle and self.update_cycle > 0:
+            # 若已有任务，先取消（防止重复）
+            if self._scheduler_task and not self._scheduler_task.done():
+                try:
+                    self._scheduler_task.cancel()
+                except Exception:
+                    pass
+            # 创建后台任务，但不 await，运行独立循环
+            self._scheduler_task = asyncio.create_task(self._update_cycle_task())
+            logger.info("已启动 list.json 后台更新调度器（周期：%d 天）", self.update_cycle)
+        else:
+            logger.info("未启用 list.json 后台自动更新（update_cycle=0）")
+
+        logger.info("猪图插件（v0.0.7，支持远程更新与定时检查）初始化完成，发送/pig获取图片")
+        logger.info(f"当前配置：冷却时间{self.cooldown_period}秒 | 本地加载{self.load_to_local} | 更新周期{self.update_cycle}天")
 
     def _is_on_cooldown(self, command_name: str) -> tuple[bool, float]:
         current_time = time.time()
@@ -264,7 +299,7 @@ class PigRandomImagePlugin(Star):
         try:
             local_abs = os.path.abspath(local_img_path)
             base_abs = os.path.abspath(self.local_img_dir)
-            if not local_abs.startswith(base_abs + os.sep) and local_abs != base_abs:
+            if not (local_abs == base_abs or local_abs.startswith(base_abs + os.sep)):
                 logger.warning("检测到可疑的本地路径，拒绝访问：%s", local_img_path)
                 return None
         except Exception:
@@ -312,7 +347,6 @@ class PigRandomImagePlugin(Star):
             return local_abs
         except Exception as e:
             logger.error(f"保存本地失败：{str(e)}，将使用临时文件")
-            # 若保存失败，则仍返回临时下载路径（如果存在）
             if os.path.exists(temp_path):
                 return temp_path
             return None
@@ -337,7 +371,6 @@ class PigRandomImagePlugin(Star):
                         raise RuntimeError("download returned None")
                     temp_filename = os.path.basename(temp_path)
                     if not self._is_valid_image_suffix(temp_filename):
-                        # 清理并抛异常以触发重试
                         try:
                             os.remove(temp_path)
                         except Exception:
@@ -350,7 +383,6 @@ class PigRandomImagePlugin(Star):
                     if attempt >= max(1, self.max_retries):
                         logger.error(f"获取{title}失败：{short_err}")
                         return None
-                    # 指数退避 + 抖动
                     backoff = (2 ** attempt) + random.random()
                     await asyncio.sleep(backoff)
         return None
@@ -396,11 +428,9 @@ class PigRandomImagePlugin(Star):
                 self.last_called_times[command_name] = time.time()
                 # 尝试异步保存到本地（不阻塞主流程）
                 if self.load_to_local:
-                    # fire-and-forget，不 await
                     asyncio.create_task(self._save_to_local_cache_async(temp_path, selected_img.get("filename")))
                 return
             else:
-                # 当前候选下载失败，继续下一个候选
                 continue
 
         # 所有候选都失败
@@ -425,12 +455,79 @@ class PigRandomImagePlugin(Star):
             logger.info("后台缓存图片至本地：%s", dest_path)
         except Exception as e:
             logger.debug("后台保存本地缓存失败：%s", e)
-            # 尝试清理临时文件（若存在）
             try:
                 if 'tmp_dest' in locals() and os.path.exists(tmp_dest):
                     os.remove(tmp_dest)
             except Exception:
                 pass
+
+    async def _update_cycle_task(self):
+        """
+        后台调度循环：在“每天零点”触发首次检查，之后根据 self.update_cycle 每隔 N 天执行一次检查。
+        使用本地时间的零点判定（与系统时区一致）。
+        若任务被取消，会干净退出。
+        """
+        try:
+            # 若 update_cycle <= 0，则不应进入此函数，但仍作防御检查
+            if not self.update_cycle or self.update_cycle <= 0:
+                return
+
+            while True:
+                # 计算距离下一个本地零点的秒数
+                now = time.time()
+                lt = time.localtime(now)
+                try:
+                    # 构造次日 0:0:0 的时间戳
+                    next_midnight_tuple = (lt.tm_year, lt.tm_mon, lt.tm_mday + 1, 0, 0, 0, lt.tm_wday, lt.tm_yday, lt.tm_isdst)
+                    next_midnight = time.mktime(next_midnight_tuple)
+                    sleep_seconds = max(0, int(next_midnight - now) + 1)  # +1 秒确保跨过零点
+                except Exception:
+                    # 在极少数情况下，直接退回到 60 秒后重试
+                    sleep_seconds = 60
+
+                logger.info("后台更新调度：等待 %s 秒 到下一个本地零点以执行更新检查", sleep_seconds)
+                # 等待到下一个零点或被取消
+                try:
+                    await asyncio.sleep(sleep_seconds)
+                except asyncio.CancelledError:
+                    logger.info("后台更新调度已被取消（等待零点期间）")
+                    break
+
+                # 到达零点，执行一次更新检查
+                try:
+                    logger.info("后台更新调度：开始在零点检查远程列表更新")
+                    remote_data = await self._fetch_remote_images()
+                    if remote_data:
+                        updated = self._apply_remote_data_if_needed(remote_data)
+                        if updated:
+                            logger.info("后台更新调度：检测到远程变化并已更新本地 list.json")
+                        else:
+                            logger.info("后台更新调度：远程数据与本地一致，未做更新")
+                    else:
+                        logger.warning("后台更新调度：未能获取远程数据，跳过本次更新")
+                except asyncio.CancelledError:
+                    logger.info("后台更新调度已被取消（执行更新期间）")
+                    break
+                except Exception as e:
+                    logger.error("后台更新调度在执行更新时发生错误（已记录）")
+                    logger.debug("后台更新出错详情：%s", e)
+
+                # 若 update_cycle > 1，则在完成零点更新后，等待 (update_cycle - 1) 天再到下一个零点
+                if self.update_cycle <= 1:
+                    # 直接循环，下一次又等待到下一个零点
+                    continue
+                else:
+                    # 计算额外天数的秒数（整天）
+                    extra_days = self.update_cycle - 1
+                    extra_seconds = extra_days * 24 * 3600
+                    logger.info("后台更新调度：按周期等待额外 %d 天 (%d 秒) 再次检查", extra_days, extra_seconds)
+                    try:
+                        await asyncio.sleep(extra_seconds)
+                    except asyncio.CancelledError:
+                        logger.info("后台更新调度已被取消（周期等待期间）")
+                        break
+        finally:
+            logger.info("后台更新调度任务退出")
 
     @filter.command("pig")
     async def pig_command(self, event: AstrMessageEvent):
@@ -439,4 +536,20 @@ class PigRandomImagePlugin(Star):
             yield result
 
     async def terminate(self):
-        logger.info("猪图插件（v0.0.5，支持远程更新）已卸载")
+        # 取消后台调度任务（若存在）
+        if self._scheduler_task:
+            try:
+                self._scheduler_task.cancel()
+                # 等待任务结束（短超时）
+                try:
+                    await asyncio.wait_for(self._scheduler_task, timeout=5)
+                except asyncio.TimeoutError:
+                    logger.debug("等待后台调度任务退出超时，任务可能仍在终止中")
+                except asyncio.CancelledError:
+                    pass
+            except Exception as e:
+                logger.debug("取消后台调度任务时发生错误：%s", e)
+            finally:
+                self._scheduler_task = None
+
+        logger.info("猪图插件（v0.0.7，支持远程更新与定时检查）已卸载")
