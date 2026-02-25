@@ -15,7 +15,7 @@ from astrbot.api.star import Context, Star, register
 from astrbot.api import AstrBotConfig, logger
 from astrbot.core.utils.io import download_image_by_url
 
-@register("astrbot_plugin_pig", "SakuraMikku", "随机发送猪相关图片", "0.0.9")
+@register("astrbot_plugin_pig", "SakuraMikku", "随机发送猪相关图片", "0.1.0")
 class PigRandomImagePlugin(Star):
     def __init__(self, context: Context, config: AstrBotConfig):
         super().__init__(context, config)
@@ -37,6 +37,33 @@ class PigRandomImagePlugin(Star):
                 self.update_cycle = 0
         except Exception:
             self.update_cycle = 0
+
+        # 是否试图匹配所有消息
+        try:
+            self.is_match_all_msg = bool(config.get("is_match_all_msg", False))
+        except Exception:
+            self.is_match_all_msg = False
+
+        # 是否精确匹配
+        try:
+            self.is_exact_match = bool(config.get("is_exact_match", True))
+        except Exception:
+            self.is_exact_match = True
+
+        # 匹配的关键词
+        try:
+            self.match_keywords = list(config.get("match_keywords", []))
+        except Exception:
+            self.match_keywords = [
+                "猪", "祝",
+                "🐷", "🐖", "🐽",
+                "㊗", "㊗️",
+            ]
+        # 不进行匹配的前缀
+        try:
+            self.exclude_prefixes = tuple(config.get("exclude_prefixes", ()))
+        except Exception:
+            self.exclude_prefixes = ("/", "!", "！", "#", "ww")
 
         self.last_called_times: Dict[str, float] = {}
         self.pig_images: List[Dict[str, Any]] = []
@@ -260,7 +287,7 @@ class PigRandomImagePlugin(Star):
         else:
             logger.info("未启用 list.json 后台自动更新（update_cycle=0）")
 
-        logger.info("猪图插件（v0.0.9，支持远程更新与定时检查）初始化完成，发送/pig获取图片")
+        logger.info("猪图插件（v0.1.0，支持远程更新与定时检查）初始化完成，发送/pig获取图片")
         logger.info(f"当前配置：冷却时间{self.cooldown_period}秒 | 本地加载{self.load_to_local} | 更新周期{self.update_cycle}天")
 
     # -------------------- 下载与缓存 --------------------
@@ -486,7 +513,7 @@ class PigRandomImagePlugin(Star):
             logger.info("后台更新调度任务退出")
 
     # -------------------- 命令绑定：与 hardwareinfo 保持同样签名 --------------------
-    @filter.command("pig")
+    @filter.command("pig", alias={"猪", "祝", "猪猪", "猪猪图"})
     async def pig_command(self, event: AstrMessageEvent):
         """
         兼容性签名 (self, event)。子命令解析使用简洁布尔表达式：
@@ -532,6 +559,30 @@ class PigRandomImagePlugin(Star):
         async for r in self._get_random_pig_image(event):
             yield r
 
+    @filter.event_message_type(filter.EventMessageType.GROUP_MESSAGE)
+    async def keyword_trigger(self, event: AstrMessageEvent):
+        if self.is_match_all_msg:
+            message_str = event.message_str
+            if not message_str:
+                return
+            if message_str.startswith(self.exclude_prefixes):
+                return
+            if self._is_trigger_keyword(message_str, self.match_keywords):
+                async for r in self._get_random_pig_image(event):
+                    yield r
+
+    def _is_trigger_keyword(self, message: str, keywords: list) -> bool:
+        """检查消息是否包含或等于触发关键词"""
+        # 完全匹配
+        if message.strip() in keywords:
+            return True
+        if not self.is_exact_match:
+            # 或者消息中包含关键词
+            for keyword in keywords:
+                if keyword in message:
+                    return True
+        return False
+
     async def terminate(self):
         if self._scheduler_task:
             try:
@@ -547,4 +598,4 @@ class PigRandomImagePlugin(Star):
             finally:
                 self._scheduler_task = None
 
-        logger.info("猪图插件（v0.0.9，支持远程更新与定时检查）已卸载")
+        logger.info("猪图插件（v0.1.0，支持远程更新与定时检查）已卸载")
