@@ -13,5 +13,27 @@
     "description":"基于天数更新(1为每天零点更新,0为不更新)",
     "type":"int",
     "default":0
+  },
+  "is_match_all_msg": {
+    "description":"是否试图匹配所有消息",
+    "hint": "开启后无需指令前缀即可触发猪猪图片的发送",
+    "type":"bool",
+    "default": true
+  },
+  "is_exact_match": {
+    "description":"匹配所有消息时是否精确匹配(开启=精确,关闭=模糊)",
+    "hint": "开启时只有消息有且仅有下面的关键词才会触发,关闭时只要消息包含关键词即可触发",
+    "type":"bool",
+    "default": false
+  },
+  "match_keywords": {
+    "description":"匹配关键词",
+    "type":"list",
+    "default": ["猪", "祝", "🐷", "🐖", "🐽", "㊗", "㊗️"]
+  },
+  "exclude_prefixes": {
+    "description":"以这些前缀开头的消息不触发",
+    "type":"list",
+    "default": ["/", "!", "！", "#", "ww"]
   }
 }
