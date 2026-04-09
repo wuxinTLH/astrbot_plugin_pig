@@ -35,33 +35,5 @@
     "description":"以这些前缀开头的消息不触发",
     "type":"list",
     "default": ["/", "!", "！", "#", "ww"]
-  },
-  "max_retries": {
-    "type": "int",
-    "description": "网络请求最大重试次数",
-    "default": 3,
-    "min": 1,
-    "max": 10
-  },
-  "request_timeout": {
-    "type": "int",
-    "description": "HTTP 请求超时时间(秒)",
-    "default": 20,
-    "min": 5,
-    "max": 60
-  },
-  "concurrent_limit": {
-    "type": "int",
-    "description": "并发下载限制",
-    "default": 4,
-    "min": 1,
-    "max": 10
-  },
-  "image_cache_ttl": {
-    "type": "int",
-    "description": "本地图片缓存有效期(秒)",
-    "default": 604800,
-    "min": 3600,
-    "max": 2592000
   }
 }
