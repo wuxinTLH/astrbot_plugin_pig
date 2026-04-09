@@ -1,601 +1,573 @@
 import os
 import re
+import sys
 import time
 import json
-import asyncio
 import random
-import shutil
-import urllib.parse
+import asyncio
+import hashlib
+from pathlib import Path
+from datetime import datetime, timedelta
+from typing import Dict, List, Optional, Any, Tuple
+
 import aiohttp
+from aiohttp import ClientTimeout, TCPConnector, ClientError
 
-from typing import Any, Dict, List, Optional, Tuple
-
-from astrbot.api.event import filter, AstrMessageEvent
-from astrbot.api.star import Context, Star, register
+from astrbot.api.event import filter, AstrMessageEvent, MessageChain
+from astrbot.api.star import Context, Star, register, StarTools
 from astrbot.api import AstrBotConfig, logger
-from astrbot.core.utils.io import download_image_by_url
 
-@register("astrbot_plugin_pig", "SakuraMikku", "随机发送猪相关图片", "0.1.0")
-class PigRandomImagePlugin(Star):
+
+# ─────────────────────────────────────────────
+#  插件元数据
+# ─────────────────────────────────────────────
+@register(
+    "astrbot_plugin_pig",
+    "SakuraMikku",
+    "猪猪表情包(随机发送/关键词触发/自动更新)",
+    "0.1.1",
+    "https://github.com/wuxinTLH/astrbot_plugin_pig",
+)
+class PigPlugin(Star):
+    """猪猪表情包插件 - 优化版"""
+
+    # ══════════════════════════════════════════
+    #  常量定义
+    # ══════════════════════════════════════════
+
+    # 默认配置
+    DEFAULT_CONFIG = {
+        "cooldown_period": 5.0,          # 指令冷却时间(秒)
+        "load_to_local": False,           # 是否缓存图片到本地
+        "update_cycle": 0,                # 自动更新周期(天), 0=禁用
+        "is_match_all_msg": False,        # 是否监听所有消息触发关键词
+        "match_keywords": ["猪", "祝", "🐷", "🐖", "猪猪", "小猪"],
+        "max_retries": 3,                 # 网络请求最大重试次数
+        "request_timeout": 20,            # 请求超时时间(秒)
+        "concurrent_limit": 4,            # 并发下载限制
+        "image_cache_ttl": 7 * 24 * 3600, # 图片缓存有效期(秒)
+    }
+
+    # 图片数据源
+    PIG_DATA_URL = "https://cdn.jsdelivr.net/gh/wuxinTLH/pig-images@main/list.json"
+    PIG_BASE_URL = "https://cdn.jsdelivr.net/gh/wuxinTLH/pig-images@main/"
+
+    # 反爬验证关键词
+    VERIFY_KEYWORDS = frozenset({
+        "automated bot check", "cloudflare", "just a moment",
+        "checking your browser", "ddos-guard", "ray id",
+        "机器人验证", "please enable javascript"
+    })
+
+    # 请求头
+    BASE_HEADERS = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+        "Accept": "image/webp,image/apng,image/*,*/*;q=0.8",
+        "Accept-Language": "zh-CN,zh;q=0.9",
+        "Cache-Control": "no-cache",
+    }
+
+    # ══════════════════════════════════════════
+    #  初始化
+    # ══════════════════════════════════════════
+
     def __init__(self, context: Context, config: AstrBotConfig):
         super().__init__(context, config)
-        # 配置项（带类型转换和默认）
-        try:
-            self.cooldown_period = float(config.get("cooldown_period", 5))
-        except Exception:
-            self.cooldown_period = 5.0
-        self.load_to_local = bool(config.get("load_to_local", False))
-        try:
-            self.max_retries = int(config.get("max_retries", 2))
-        except Exception:
-            self.max_retries = 2
 
-        # 更新周期（按天），0 表示不自动更新
-        try:
-            self.update_cycle = int(config.get("update_cycle", 0))
-            if self.update_cycle < 0:
-                self.update_cycle = 0
-        except Exception:
-            self.update_cycle = 0
-
-        # 是否试图匹配所有消息
-        try:
-            self.is_match_all_msg = bool(config.get("is_match_all_msg", False))
-        except Exception:
-            self.is_match_all_msg = False
-
-        # 是否精确匹配
-        try:
-            self.is_exact_match = bool(config.get("is_exact_match", True))
-        except Exception:
-            self.is_exact_match = True
-
-        # 匹配的关键词
-        try:
-            self.match_keywords = list(config.get("match_keywords", []))
-        except Exception:
-            self.match_keywords = [
-                "猪", "祝",
-                "🐷", "🐖", "🐽",
-                "㊗", "㊗️",
-            ]
-        # 不进行匹配的前缀
-        try:
-            self.exclude_prefixes = tuple(config.get("exclude_prefixes", ()))
-        except Exception:
-            self.exclude_prefixes = ("/", "!", "！", "#", "ww")
-
-        self.last_called_times: Dict[str, float] = {}
-        self.pig_images: List[Dict[str, Any]] = []
-        base_dir = os.path.dirname(__file__)
-        self.local_img_dir = os.path.join(base_dir, "imgs", "pig")
-        self.json_path = os.path.join(base_dir, "list.json")
-
-        # 并发控制与锁
-        self._download_semaphore = asyncio.Semaphore(3)
-        self._update_lock = asyncio.Lock()
-        self._scheduler_task: Optional[asyncio.Task] = None
-
-        self._create_local_dir()
-        self._load_pig_from_json()
-
-    # -------------------- 工具 --------------------
-    def _create_local_dir(self):
-        if not self.load_to_local:
-            return
-        try:
-            os.makedirs(self.local_img_dir, exist_ok=True)
-            logger.info(f"本地图片目录初始化完成：{self.local_img_dir}")
-        except OSError as e:
-            self.load_to_local = False
-            logger.error(f"创建图片目录失败：{str(e)}，已切换为仅网络加载")
-
-    def _sanitize_filename(self, name: str, default: str = "image") -> str:
-        if not name:
-            name = default
-        name = name.replace("\x00", "")
-        name = name.replace("/", "_").replace("\\", "_")
-        allowed = set("-_.() ")
-        cleaned_chars: List[str] = []
-        for ch in name:
-            if ch.isalnum() or ch in allowed:
-                cleaned_chars.append(ch)
-                continue
-            o = ord(ch)
-            if 0x4e00 <= o <= 0x9fff:
-                cleaned_chars.append(ch)
-                continue
-            cleaned_chars.append("_")
-        cleaned = "".join(cleaned_chars).strip()
-        MAX_LEN = 200
-        if len(cleaned) > MAX_LEN:
-            cleaned = cleaned[:MAX_LEN]
-        if cleaned == "":
-            cleaned = default
-        return cleaned
-
-    def _quote_path_preserving_slashes(self, path: str) -> str:
-        segments = path.split("/")
-        return "/".join(urllib.parse.quote(seg) for seg in segments)
-
-    def _is_valid_url(self, url: str) -> bool:
-        try:
-            p = urllib.parse.urlparse(url)
-            return p.scheme in ("http", "https") and bool(p.netloc)
-        except Exception:
-            return False
-
-    def _clean_text(self, text: str) -> str:
-        if not isinstance(text, str):
-            return ""
-        text = re.sub(r"\[At:[^\]]+\]", "", text)
-        text = re.sub(r"<at[^>]*>.*?</at>", "", text, flags=re.I | re.S)
-        text = text.strip()
-        text = text.lstrip("/\\／﹨")
-        text = re.sub(r"\s+", " ", text)
-        return text.strip()
-
-    # -------------------- JSON 加载/更新 --------------------
-    def _load_pig_from_json(self):
-        if not os.path.exists(self.json_path):
-            logger.info("list.json 不存在，跳过本地加载")
-            self.pig_images = []
-            return
-
-        try:
-            with open(self.json_path, "r", encoding="utf-8") as f:
-                json_data = json.load(f)
-        except Exception as e:
-            logger.error(f"加载list.json失败（解析或读取错误）：{e}")
-            self.pig_images = []
-            return
-
-        raw_images = json_data.get("images", []) if isinstance(json_data, dict) else []
-        self.pig_images.clear()
-        for img in raw_images:
-            if not isinstance(img, dict):
-                continue
-            thumbnail = img.get("thumbnail", "")
-            if not thumbnail:
-                logger.warning(f"跳过空thumbnail图片：{img.get('title', '未知')}")
-                continue
-
-            thumbnail = str(thumbnail).lstrip("/")
-            base_url = "https://pighub.top/"
-            if self._is_valid_url(thumbnail):
-                unencoded_url = thumbnail
-            else:
-                unencoded_url = urllib.parse.urljoin(base_url, thumbnail)
-
+        # ── 配置加载（带类型安全转换）──
+        def _safe_get(cfg, key, default, cast_type):
             try:
-                parsed = urllib.parse.urlparse(unencoded_url)
-                encoded_path = self._quote_path_preserving_slashes(parsed.path)
-                encoded_full_url = urllib.parse.urlunparse(
-                    (parsed.scheme, parsed.netloc, encoded_path, parsed.params, parsed.query, parsed.fragment)
-                )
-            except Exception:
-                logger.debug(f"构建图片 URL 失败，跳过：{unencoded_url}")
-                continue
+                val = cfg.get(key, default)
+                return cast_type(val) if val is not None else default
+            except (TypeError, ValueError):
+                return default
 
-            img_filename = img.get("filename")
-            if img_filename:
-                img_filename = self._sanitize_filename(str(img_filename))
-            else:
-                file_ext = os.path.splitext(thumbnail)[-1] or ".jpg"
-                if not file_ext or "." not in file_ext:
-                    file_ext = ".jpg"
-                title_part = img.get("title", "未知图片")
-                img_filename = self._sanitize_filename(f"{title_part}{file_ext}")
+        self.cooldown_period: float = _safe_get(config, "cooldown_period", 5.0, float)
+        self.load_to_local: bool = _safe_get(config, "load_to_local", False, bool)
+        self.update_cycle: int = _safe_get(config, "update_cycle", 0, int)
+        self.is_match_all_msg: bool = _safe_get(config, "is_match_all_msg", False, bool)
+        self.match_keywords: List[str] = config.get("match_keywords", self.DEFAULT_CONFIG["match_keywords"]) or []
+        self.max_retries: int = min(_safe_get(config, "max_retries", 3, int), 5)
+        self.request_timeout: int = _safe_get(config, "request_timeout", 20, int)
+        self.concurrent_limit: int = _safe_get(config, "concurrent_limit", 4, int)
+        self.image_cache_ttl: int = _safe_get(config, "image_cache_ttl", 7 * 24 * 3600, int)
 
-            valid_suffixes = (".jpg", ".jpeg", ".png", ".gif", ".bmp")
-            if not img_filename.lower().endswith(valid_suffixes):
-                img_filename = img_filename + ".jpg"
-
-            self.pig_images.append({
-                "title": img.get("title", "随机猪图"),
-                "full_url": encoded_full_url,
-                "filename": img_filename,
-                "id": img.get("id")
-            })
-
-        logger.info(f"图片配置加载成功，共{len(self.pig_images)}张图片（v0.0.9，支持远程更新）")
-
-    async def _fetch_remote_images(self):
-        url = "https://pighub.top/api/images?limit=10000&sort=latest"
+        # ── 目录初始化 ──
         try:
-            async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=10)) as session:
-                async with session.get(url) as response:
-                    if response.status == 200:
-                        return await response.json()
-                    logger.error(f"远程请求失败，状态码：{response.status}")
-                    return None
-        except Exception as e:
-            logger.error(f"远程请求异常：{str(e)}")
-            return None
+            data_dir = Path(StarTools.get_data_dir("astrbot_plugin_pig"))
+            data_dir.mkdir(parents=True, exist_ok=True)
+        except Exception:
+            data_dir = Path(__file__).parent.resolve() / "data"
+            data_dir.mkdir(parents=True, exist_ok=True)
 
-    def _apply_remote_data_if_needed(self, remote_data):
-        if not isinstance(remote_data, dict):
-            return False
+        self.base_dir = Path(__file__).parent.resolve()
+        self.cache_dir = data_dir / "cache"
+        self.img_dir = self.cache_dir / "images"
+        self.list_file = self.cache_dir / "list.json"
 
-        local_data = None
-        if os.path.exists(self.json_path):
+        for p in (self.cache_dir, self.img_dir):
             try:
-                with open(self.json_path, "r", encoding="utf-8") as f:
-                    local_data = json.load(f)
+                p.mkdir(parents=True, exist_ok=True)
+                if sys.platform.startswith("linux"):
+                    os.chmod(str(p), 0o755)
             except Exception:
-                local_data = None
+                logger.debug(f"[PIG] 目录创建跳过: {p}")
 
-        def extract_ids(d):
-            if not d or not isinstance(d, dict):
-                return set()
-            imgs = d.get("images")
-            if not imgs or not isinstance(imgs, list):
-                return set()
-            return {item.get("id") for item in imgs if isinstance(item, dict) and "id" in item}
+        # ── 内存状态 ──
+        self.pig_images: List[Dict[str, str]] = []
+        self._image_cache: Dict[str, Tuple[List[Dict], float]] = {"data": None, "expire": 0}
+        self._cooldown: Dict[str, float] = {}  # identity -> last_call_time
+        self._http_session: Optional[aiohttp.ClientSession] = None
+        self._download_semaphore: Optional[asyncio.Semaphore] = None
+        self._update_task: Optional[asyncio.Task] = None
+        self._cache_lock = asyncio.Lock()
 
-        local_ids = extract_ids(local_data)
-        remote_ids = extract_ids(remote_data)
-
-        need_update = False
-        if not local_data:
-            need_update = True
-        else:
-            if local_ids != remote_ids or len(local_data.get("images", [])) != len(remote_data.get("images", [])):
-                need_update = True
-
-        if not need_update:
-            return False
-
-        tmp_path = f"{self.json_path}.tmp_{int(time.time())}_{random.randint(0, 10**9)}"
-        try:
-            with open(tmp_path, "w", encoding="utf-8") as f:
-                json.dump(remote_data, f, ensure_ascii=False, indent=2)
-            os.replace(tmp_path, self.json_path)
-            logger.info("本地list.json已更新（远程变化），已保存到 %s", self.json_path)
-            self._load_pig_from_json()
-            return True
-        except Exception as e:
-            logger.error("更新本地 list.json 失败（已记录）。")
-            logger.debug("更新 list.json 失败详情：%s", e)
-            try:
-                if os.path.exists(tmp_path):
-                    os.remove(tmp_path)
-            except Exception:
-                pass
-            return False
+    # ══════════════════════════════════════════
+    #  生命周期
+    # ══════════════════════════════════════════
 
     async def initialize(self):
-        remote_data = await self._fetch_remote_images()
-        if remote_data:
-            try:
-                updated = self._apply_remote_data_if_needed(remote_data)
-                if updated:
-                    logger.info("初始化时已从远程更新本地列表")
-                else:
-                    logger.info("本地list.json与远程数据一致，无需更新（初始化检查）")
-            except Exception as e:
-                logger.error(f"处理远程数据时出错：{str(e)}")
+        """插件初始化"""
+        logger.info("[PIG] 猪猪表情包插件初始化")
 
-        if self.update_cycle and self.update_cycle > 0:
-            if self._scheduler_task and not self._scheduler_task.done():
-                try:
-                    self._scheduler_task.cancel()
-                except Exception:
-                    pass
-            self._scheduler_task = asyncio.create_task(self._update_cycle_task())
-            logger.info("已启动 list.json 后台更新调度器（周期：%d 天）", self.update_cycle)
-        else:
-            logger.info("未启用 list.json 后台自动更新（update_cycle=0）")
+        # HTTP Session
+        ssl_ctx = False if self.config.get("insecure_skip_verify", False) else True
+        conn = TCPConnector(
+            ssl=ssl_ctx,
+            limit=self.concurrent_limit * 2,
+            limit_per_host=self.concurrent_limit,
+            ttl_dns_cache=300,
+        )
+        timeout = ClientTimeout(total=self.request_timeout, connect=8, sock_read=15)
+        self._http_session = aiohttp.ClientSession(
+            connector=conn,
+            timeout=timeout,
+            headers=self.BASE_HEADERS,
+        )
+        self._download_semaphore = asyncio.Semaphore(self.concurrent_limit)
 
-        logger.info("猪图插件（v0.1.0，支持远程更新与定时检查）初始化完成，发送/pig获取图片")
-        logger.info(f"当前配置：冷却时间{self.cooldown_period}秒 | 本地加载{self.load_to_local} | 更新周期{self.update_cycle}天")
+        # 加载图片列表
+        await self._load_pig_list()
 
-    # -------------------- 下载与缓存 --------------------
-    def _is_on_cooldown(self, command_name: str) -> Tuple[bool, float]:
-        current_time = time.time()
-        last_called = self.last_called_times.get(command_name, 0)
-        elapsed_time = current_time - last_called
-        return elapsed_time < self.cooldown_period, max(0, self.cooldown_period - elapsed_time)
+        # 启动定时更新任务（如果启用）
+        if self.update_cycle > 0:
+            self._update_task = asyncio.create_task(self._update_cycle_task())
+            logger.info(f"[PIG] 自动更新已启用，周期: {self.update_cycle}天")
 
-    def _is_valid_image_suffix(self, filename: str) -> bool:
-        valid_suffixes = (".jpg", ".jpeg", ".png", ".gif", ".bmp")
-        return filename.lower().endswith(valid_suffixes)
-
-    async def _get_local_image(self, selected_img):
-        img_filename = selected_img.get("filename")
-        if not img_filename:
-            return None
-        local_img_path = os.path.join(self.local_img_dir, img_filename)
-
-        try:
-            local_abs = os.path.abspath(local_img_path)
-            base_abs = os.path.abspath(self.local_img_dir)
-            if not (local_abs == base_abs or local_abs.startswith(base_abs + os.sep)):
-                logger.warning("检测到可疑的本地路径，拒绝访问：%s", local_img_path)
-                return None
-        except Exception:
-            logger.warning("本地路径解析失败，跳过本地加载：%s", local_img_path)
-            return None
-
-        if os.path.exists(local_abs) and self._is_valid_image_suffix(local_abs):
-            logger.info(f"使用本地图片：{img_filename}")
-            return local_abs
-
-        logger.info(f"本地图片缺失，开始下载：{img_filename}")
-        url = selected_img.get("full_url", "")
-        if not self._is_valid_url(url):
-            logger.warning("图片 URL 无效，无法下载：%s", url)
-            return None
-
-        async with self._download_semaphore:
-            try:
-                temp_path = await download_image_by_url(url)
-            except Exception as e:
-                logger.error(f"调用 download_image_by_url 出错：{e}")
-                temp_path = None
-
-        if not temp_path:
-            logger.error(f"网络下载失败，无法获取{img_filename}")
-            return None
-
-        temp_filename = os.path.basename(temp_path)
-        if not self._is_valid_image_suffix(temp_filename):
-            try:
-                os.remove(temp_path)
-            except Exception:
-                pass
-            logger.error(f"下载文件非图片格式，已清理：{temp_filename}")
-            return None
-
-        try:
-            os.makedirs(self.local_img_dir, exist_ok=True)
-            tmp_dest = os.path.join(self.local_img_dir, f".tmp_{int(time.time())}_{random.randint(0,10**9)}")
-            shutil.copy2(temp_path, tmp_dest)
-            os.replace(tmp_dest, local_abs)
-            logger.info(f"图片保存到本地：{local_abs}")
-            return local_abs
-        except Exception as e:
-            logger.error(f"保存本地失败：{str(e)}，将使用临时文件")
-            if os.path.exists(temp_path):
-                return temp_path
-            return None
-
-    async def _download_with_retries(self, url: str, title: str):
-        if not self._is_valid_url(url):
-            logger.warning("尝试下载无效URL：%s", url)
-            return None
-
-        attempt = 0
-        while attempt < max(1, self.max_retries):
-            attempt += 1
-            async with self._download_semaphore:
-                try:
-                    logger.info(f"网络加载尝试{attempt}/{self.max_retries}：{title}")
-                    temp_path = await download_image_by_url(url)
-                    if not temp_path:
-                        raise RuntimeError("download returned None")
-                    temp_filename = os.path.basename(temp_path)
-                    if not self._is_valid_image_suffix(temp_filename):
-                        try:
-                            os.remove(temp_path)
-                        except Exception:
-                            pass
-                        raise RuntimeError("非图片格式")
-                    return temp_path
-                except Exception as e:
-                    short_err = str(e)[:120]
-                    logger.debug(f"下载尝试失败（{attempt}/{self.max_retries}）：{short_err}")
-                    if attempt >= max(1, self.max_retries):
-                        logger.error(f"获取{title}失败：{short_err}")
-                        return None
-                    backoff = (2 ** attempt) + random.random()
-                    await asyncio.sleep(backoff)
-        return None
-
-    async def _get_random_pig_image(self, event: AstrMessageEvent):
-        command_name = "pig"
-        on_cooldown, remaining = self._is_on_cooldown(command_name)
-        if on_cooldown:
-            yield event.plain_result(f"冷却中～还需{remaining:.0f}秒")
-            return
-
-        if not self.pig_images:
-            yield event.plain_result("无可用猪图数据")
-            return
-
-        tried = set()
-        max_candidates = min(len(self.pig_images), 3)
-        for _ in range(max_candidates):
-            idx = random.randrange(len(self.pig_images))
-            if idx in tried and len(tried) < len(self.pig_images):
-                continue
-            tried.add(idx)
-            selected_img = self.pig_images[idx]
-            img_title = selected_img.get("title", "随机猪图")
-
-            if self.load_to_local:
-                try:
-                    img_path = await self._get_local_image(selected_img)
-                    if img_path:
-                        yield event.image_result(img_path)
-                        self.last_called_times[command_name] = time.time()
-                        return
-                    logger.debug("本地加载失败，切换为网络加载")
-                except Exception as e:
-                    logger.error(f"本地加载出错：{str(e)}，切换为网络加载")
-
-            temp_path = await self._download_with_retries(selected_img.get("full_url", ""), img_title)
-            if temp_path:
-                yield event.image_result(temp_path)
-                self.last_called_times[command_name] = time.time()
-                if self.load_to_local:
-                    asyncio.create_task(self._save_to_local_cache_async(temp_path, selected_img.get("filename")))
-                return
-            else:
-                continue
-
-        yield event.plain_result("获取猪图失败，请稍后重试")
-        self.last_called_times[command_name] = time.time()
-
-    async def _save_to_local_cache_async(self, downloaded_path: str, target_filename: str):
-        if not downloaded_path:
-            return
-        try:
-            if not target_filename:
-                target_filename = os.path.basename(downloaded_path)
-            safe_name = self._sanitize_filename(str(target_filename))
-            os.makedirs(self.local_img_dir, exist_ok=True)
-            dest_path = os.path.join(self.local_img_dir, safe_name)
-            tmp_dest = os.path.join(self.local_img_dir, f".tmp_{int(time.time())}_{random.randint(0, 10**9)}")
-            shutil.copy2(downloaded_path, tmp_dest)
-            os.replace(tmp_dest, dest_path)
-            logger.info("后台缓存图片至本地：%s", dest_path)
-        except Exception as e:
-            logger.debug("后台保存本地缓存失败：%s", e)
-            try:
-                if 'tmp_dest' in locals() and os.path.exists(tmp_dest):
-                    os.remove(tmp_dest)
-            except Exception:
-                pass
-
-    async def _update_cycle_task(self):
-        try:
-            if not self.update_cycle or self.update_cycle <= 0:
-                return
-
-            while True:
-                now = time.time()
-                lt = time.localtime(now)
-                try:
-                    next_midnight_tuple = (lt.tm_year, lt.tm_mon, lt.tm_mday + 1, 0, 0, 0, lt.tm_wday, lt.tm_yday, lt.tm_isdst)
-                    next_midnight = time.mktime(next_midnight_tuple)
-                    sleep_seconds = max(0, int(next_midnight - now) + 1)
-                except Exception:
-                    sleep_seconds = 60
-
-                logger.info("后台更新调度：等待 %s 秒 到下一个本地零点以执行更新检查", sleep_seconds)
-                try:
-                    await asyncio.sleep(sleep_seconds)
-                except asyncio.CancelledError:
-                    logger.info("后台更新调度已被取消（等待零点期间）")
-                    break
-
-                try:
-                    logger.info("后台更新调度：开始在零点检查远程列表更新")
-                    remote_data = await self._fetch_remote_images()
-                    if remote_data:
-                        updated = self._apply_remote_data_if_needed(remote_data)
-                        if updated:
-                            logger.info("后台更新调度：检测到远程变化并已更新本地 list.json")
-                        else:
-                            logger.info("后台更新调度：远程数据与本地一致，未做更新")
-                    else:
-                        logger.warning("后台更新调度：未能获取远程数据，跳过本次更新")
-                except asyncio.CancelledError:
-                    logger.info("后台更新调度已被取消（执行更新期间）")
-                    break
-                except Exception as e:
-                    logger.error("后台更新调度在执行更新时发生错误（已记录）")
-                    logger.debug("后台更新出错详情：%s", e)
-
-                if self.update_cycle <= 1:
-                    continue
-                else:
-                    extra_days = self.update_cycle - 1
-                    extra_seconds = extra_days * 24 * 3600
-                    logger.info("后台更新调度：按周期等待额外 %d 天 (%d 秒) 再次检查", extra_days, extra_seconds)
-                    try:
-                        await asyncio.sleep(extra_seconds)
-                    except asyncio.CancelledError:
-                        logger.info("后台更新调度已被取消（周期等待期间）")
-                        break
-        finally:
-            logger.info("后台更新调度任务退出")
-
-    # -------------------- 命令绑定：与 hardwareinfo 保持同样签名 --------------------
-    @filter.command("pig", alias={"猪", "祝", "猪猪", "猪猪图"})
-    async def pig_command(self, event: AstrMessageEvent):
-        """
-        兼容性签名 (self, event)。子命令解析使用简洁布尔表达式：
-        is_update = (cmd == "pig" and sub in ("update", "更新")) or (cmd in ("update", "更新") and sub is None)
-        """
-        raw_message = getattr(event, "message_str", None)
-        if not raw_message:
-            raw_message = getattr(event, "message", "") or ""
-        raw_message = raw_message or ""
-        clean = self._clean_text(raw_message)
-        logger.debug(f"[pig] 解析到消息：{clean}")
-
-        if not clean:
-            async for r in self._get_random_pig_image(event):
-                yield r
-            return
-
-        parts = clean.split(maxsplit=1)
-        cmd = parts[0].lower() if parts else ""
-        sub = parts[1].strip().lower() if len(parts) >= 2 else None
-
-        # 简洁布尔表达式判定是否为 update 命令
-        is_update = (cmd == "pig" and sub in ("update", "更新")) or (cmd in ("update", "更新") and sub is None)
-
-        if is_update:
-            async with self._update_lock:
-                try:
-                    remote_data = await self._fetch_remote_images()
-                    if not remote_data:
-                        yield event.plain_result("手动更新失败：无法拉取远程数据")
-                        return
-                    updated = self._apply_remote_data_if_needed(remote_data)
-                    if updated:
-                        yield event.plain_result("手动更新成功：本地 list.json 已更新")
-                    else:
-                        yield event.plain_result("手动更新完成：无需更新（本地已最新）")
-                except Exception as e:
-                    logger.error("手动更新过程中发生异常：%s", e)
-                    yield event.plain_result(f"手动更新失败：{str(e)}")
-            return
-
-        # 非 update -> 返回随机图片
-        async for r in self._get_random_pig_image(event):
-            yield r
-
-    @filter.event_message_type(filter.EventMessageType.GROUP_MESSAGE)
-    async def keyword_trigger(self, event: AstrMessageEvent):
-        if self.is_match_all_msg:
-            message_str = event.message_str
-            if not message_str:
-                return
-            if message_str.startswith(self.exclude_prefixes):
-                return
-            if self._is_trigger_keyword(message_str, self.match_keywords):
-                async for r in self._get_random_pig_image(event):
-                    yield r
-
-    def _is_trigger_keyword(self, message: str, keywords: list) -> bool:
-        """检查消息是否包含或等于触发关键词"""
-        # 完全匹配
-        if message.strip() in keywords:
-            return True
-        if not self.is_exact_match:
-            # 或者消息中包含关键词
-            for keyword in keywords:
-                if keyword in message:
-                    return True
-        return False
+        # 启动缓存清理协程
+        asyncio.create_task(self._cache_cleanup_loop())
 
     async def terminate(self):
-        if self._scheduler_task:
+        """插件卸载"""
+        # 取消定时任务
+        if self._update_task and not self._update_task.done():
+            self._update_task.cancel()
             try:
-                self._scheduler_task.cancel()
-                try:
-                    await asyncio.wait_for(self._scheduler_task, timeout=5)
-                except asyncio.TimeoutError:
-                    logger.debug("等待后台调度任务退出超时，任务可能仍在终止中")
-                except asyncio.CancelledError:
-                    pass
-            except Exception as e:
-                logger.debug("取消后台调度任务时发生错误：%s", e)
-            finally:
-                self._scheduler_task = None
+                await self._update_task
+            except asyncio.CancelledError:
+                pass
 
-        logger.info("猪图插件（v0.1.0，支持远程更新与定时检查）已卸载")
+        # 关闭 HTTP Session
+        if self._http_session and not self._http_session.closed:
+            await self._http_session.close()
+
+        logger.info("[PIG] 猪猪表情包插件已卸载")
+
+    # ══════════════════════════════════════════
+    #  定时任务
+    # ══════════════════════════════════════════
+
+    async def _update_cycle_task(self):
+        """定时更新图片列表任务 - 修复日期计算问题"""
+        while True:
+            try:
+                # ✅ 使用 datetime 正确计算到次日零点的时间
+                now = datetime.now()
+                tomorrow = (now + timedelta(days=1)).replace(
+                    hour=0, minute=0, second=0, microsecond=0
+                )
+                sleep_seconds = max(0, (tomorrow - now).total_seconds())
+                
+                logger.debug(f"[PIG] 距离下次更新还有 {sleep_seconds:.0f} 秒")
+                await asyncio.sleep(sleep_seconds)
+
+                # 执行更新
+                logger.info("[PIG] 执行定时图片列表更新")
+                await self._load_pig_list(force=True)
+
+                # 如果配置了多日周期，额外等待
+                if self.update_cycle > 1:
+                    extra_sleep = (self.update_cycle - 1) * 86400
+                    await asyncio.sleep(extra_sleep)
+
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                logger.exception(f"[PIG] 定时更新异常: {e}")
+                await asyncio.sleep(300)  # 出错后等待5分钟重试
+
+    async def _cache_cleanup_loop(self):
+        """定期清理过期缓存图片"""
+        while True:
+            try:
+                await asyncio.sleep(3600)  # 每小时检查一次
+                await asyncio.to_thread(self._evict_expired_images)
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                logger.debug(f"[PIG] 缓存清理异常: {e}")
+
+    def _evict_expired_images(self):
+        """清理磁盘上过期的缓存图片"""
+        if not self.img_dir.exists():
+            return
+        now = time.time()
+        cleaned = 0
+        for img_file in self.img_dir.glob("*.jpg"):
+            try:
+                if now - img_file.stat().st_mtime > self.image_cache_ttl:
+                    img_file.unlink(missing_ok=True)
+                    cleaned += 1
+            except Exception:
+                pass
+        if cleaned:
+            logger.info(f"[PIG] 清理过期缓存图片 {cleaned} 张")
+
+    # ══════════════════════════════════════════
+    #  工具函数
+    # ══════════════════════════════════════════
+
+    def _get_identity(self, event: AstrMessageEvent) -> str:
+        """获取用户唯一标识（用于冷却）"""
+        user_id = getattr(event, "user_id", None) or \
+                  getattr(getattr(event, "sender", None), "user_id", None) or \
+                  getattr(getattr(event, "from_user", None), "id", None)
+        
+        group_id = getattr(event, "group_id", None) or \
+                   getattr(getattr(event, "session", None), "group_id", None)
+        
+        if group_id:
+            return f"group:{group_id}"
+        return f"user:{user_id}" if user_id else f"temp:{int(time.time() // 600)}"
+
+    def _is_on_cooldown(self, identity: str) -> Tuple[bool, int]:
+        """检查冷却状态"""
+        now = time.time()
+        last = self._cooldown.get(identity, 0)
+        remaining = self.cooldown_period - (now - last)
+        if remaining > 0:
+            return True, max(0, int(remaining) + 1)
+        return False, 0
+
+    def _clean_text(self, text: str) -> str:
+        """清理消息文本 - 修复正则表达式"""
+        if not isinstance(text, str):
+            return ""
+        # ✅ 修复: 正确匹配 <at>...</at> 标签
+        text = re.sub(r"<at[^>]*>.*?</at>", "", text, flags=re.I | re.S)
+        text = re.sub(r"\[At:[^\]]+\]", "", text)
+        text = text.strip().lstrip("/\\／﹨")
+        return re.sub(r"\s+", " ", text).strip()
+
+    def _is_trigger_keyword(self, message: str) -> bool:
+        """检查消息是否包含触发关键词 - 优化匹配效率"""
+        # ✅ 使用 any() 更简洁高效
+        return any(kw in message for kw in self.match_keywords)
+
+    def _sanitize_filename(self, filename: str) -> str:
+        """安全化文件名，防止路径遍历"""
+        # 提取纯文件名
+        name = Path(filename).name
+        # 移除危险字符
+        safe_name = re.sub(r'[\\/*?:"<>|]', "_", name)
+        # 限制长度 + 添加哈希防止冲突
+        if len(safe_name) > 100:
+            name_part, ext = os.path.splitext(safe_name)
+            safe_name = name_part[:80] + "_" + hashlib.md5(safe_name.encode()).hexdigest()[:16] + ext
+        return safe_name
+
+    def _get_local_image_path(self, url: str) -> Path:
+        """根据 URL 生成安全的本地缓存路径 - 增强路径安全"""
+        # ✅ 使用 pathlib.resolve() 防止路径遍历
+        filename = self._sanitize_filename(url.split("/")[-1])
+        local_path = (self.img_dir / filename).resolve()
+        base_path = self.img_dir.resolve()
+        
+        # 双重校验路径安全
+        if not str(local_path).startswith(str(base_path) + os.sep):
+            logger.warning(f"[PIG] 路径遍历攻击尝试: {local_path}")
+            return None
+        return local_path
+
+    # ══════════════════════════════════════════
+    #  HTTP 请求
+    # ══════════════════════════════════════════
+
+    async def _fetch_json(self, url: str) -> Optional[List[Dict]]:
+        """获取 JSON 数据"""
+        for attempt in range(self.max_retries):
+            try:
+                async with self._http_session.get(url) as resp:
+                    if resp.status == 200:
+                        data = await resp.json()
+                        if isinstance(data, list):
+                            return data
+                    elif resp.status == 429:
+                        retry_after = int(resp.headers.get("Retry-After", 10))
+                        await asyncio.sleep(retry_after)
+                        continue
+            except asyncio.CancelledError:
+                raise
+            except (ClientError, json.JSONDecodeError) as e:
+                logger.warning(f"[PIG] 请求失败 (尝试{attempt+1}): {e}")
+            if attempt < self.max_retries - 1:
+                await asyncio.sleep(min(2 ** attempt, 8))
+        return None
+
+    async def _download_image(self, url: str, local_path: Path) -> bool:
+        """下载图片到本地 - 带并发控制"""
+        async with self._download_semaphore:
+            for attempt in range(self.max_retries):
+                try:
+                    async with self._http_session.get(url) as resp:
+                        if resp.status != 200:
+                            continue
+                        content = await resp.read()
+                        if len(content) < 512:  # 最小图片大小校验
+                            continue
+                        
+                        # ✅ 原子写入: 先写临时文件，再重命名
+                        tmp_path = local_path.with_suffix(".tmp")
+                        tmp_path.write_bytes(content)
+                        tmp_path.replace(local_path)
+                        
+                        if sys.platform.startswith("linux"):
+                            try:
+                                os.chmod(str(local_path), 0o644)
+                            except Exception:
+                                pass
+                        return True
+                except asyncio.CancelledError:
+                    raise
+                except Exception as e:
+                    logger.warning(f"[PIG] 下载失败 (尝试{attempt+1}): {e}")
+                await asyncio.sleep(min(2 ** attempt, 5))
+            return False
+
+    # ══════════════════════════════════════════
+    #  图片列表管理
+    # ══════════════════════════════════════════
+
+    async def _load_pig_list(self, force: bool = False) -> bool:
+        """加载/刷新图片列表 - 添加内存缓存"""
+        async with self._cache_lock:
+            # ✅ 内存缓存: 避免重复请求
+            now = time.time()
+            cache = self._image_cache
+            if not force and cache["data"] and now < cache["expire"]:
+                self.pig_images = cache["data"]
+                return True
+
+            # 尝试读取本地缓存文件
+            if not force and self.list_file.exists():
+                try:
+                    data = json.loads(self.list_file.read_text(encoding="utf-8"))
+                    if isinstance(data, list) and data:
+                        self.pig_images = data
+                        cache["data"] = data
+                        cache["expire"] = now + 300  # 5分钟内存缓存
+                        return True
+                except Exception as e:
+                    logger.warning(f"[PIG] 读取本地列表失败: {e}")
+
+            # 从网络获取
+            data = await self._fetch_json(self.PIG_DATA_URL)
+            if data and isinstance(data, list):
+                self.pig_images = data
+                # ✅ 原子写入本地缓存
+                try:
+                    tmp = self.list_file.with_suffix(".tmp")
+                    tmp.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+                    tmp.replace(self.list_file)
+                except Exception as e:
+                    logger.warning(f"[PIG] 保存本地列表失败: {e}")
+                
+                cache["data"] = data
+                cache["expire"] = now + 300
+                logger.info(f"[PIG] 图片列表已加载/更新，共 {len(data)} 张")
+                return True
+            
+            logger.error("[PIG] 图片列表加载失败")
+            return False
+
+    # ══════════════════════════════════════════
+    #  图片获取逻辑 - 统一缓存处理
+    # ══════════════════════════════════════════
+
+    async def _ensure_image_cached(self, img_info: Dict[str, str]) -> Optional[str]:
+        """
+        ✅ 统一缓存函数: 确保图片已缓存到本地
+        返回: 本地文件路径 或 None
+        """
+        url = img_info.get("url") or img_info.get("image_url")
+        if not url:
+            return None
+
+        # 如果未启用本地缓存，直接返回原链接
+        if not self.load_to_local:
+            return url
+
+        local_path = self._get_local_image_path(url)
+        if not local_path:
+            return url
+
+        # 本地已存在且有效
+        if local_path.exists() and local_path.stat().st_size > 1024:
+            return str(local_path)
+
+        # 下载并缓存
+        if await self._download_image(url, local_path):
+            return str(local_path)
+        
+        # 下载失败，返回原链接兜底
+        return url
+
+    async def _get_random_pig_image(self) -> Optional[str]:
+        """获取随机猪猪图片 - 修复随机去重逻辑"""
+        if not self.pig_images:
+            await self._load_pig_list()
+        
+        if not self.pig_images:
+            return None
+
+        # ✅ 使用 random.sample 确保不重复且简洁
+        max_try = min(3, len(self.pig_images))
+        candidates = random.sample(range(len(self.pig_images)), max_try)
+        
+        for idx in candidates:
+            img_info = self.pig_images[idx]
+            local_path = await self._ensure_image_cached(img_info)
+            if local_path:
+                return local_path
+        
+        return None
+
+    # ══════════════════════════════════════════
+    #  命令处理
+    # ══════════════════════════════════════════
+
+    async def _send_random_pig(self, event: AstrMessageEvent):
+        """发送随机猪猪图片"""
+        identity = self._get_identity(event)
+        
+        # 冷却检查
+        on_cd, remain = self._is_on_cooldown(identity)
+        if on_cd:
+            yield event.plain_result(f"🐷 冷却中，请 {remain} 秒后再试~")
+            return
+
+        # 记录冷却时间
+        self._cooldown[identity] = time.time()
+
+        # 获取图片
+        yield event.plain_result("🐷 正在挑选猪猪...")
+        img_path = await self._get_random_pig_image()
+        
+        if img_path and os.path.exists(img_path):
+            yield event.image_result(img_path)
+        else:
+            yield event.plain_result("😢 猪猪跑丢了，请稍后再试~")
+
+    async def _handle_update_command(self, event: AstrMessageEvent, force: bool = False):
+        """处理更新命令"""
+        yield event.plain_result("🔄 正在更新猪猪列表...")
+        success = await self._load_pig_list(force=True)
+        if success:
+            yield event.plain_result(f"✅ 更新成功！当前共 {len(self.pig_images)} 张猪猪~")
+        else:
+            yield event.plain_result("❌ 更新失败，请检查网络连接")
+
+    # ══════════════════════════════════════════
+    #  命令入口
+    # ══════════════════════════════════════════
+
+    @filter.command("pig")
+    @filter.command("猪猪")
+    async def pig_command(self, event: AstrMessageEvent, sub: str = None):
+        """
+        猪猪命令入口
+        用法:
+          /pig          - 随机发送猪猪
+          /pig update   - 手动更新列表
+          /更新         - 同上
+        """
+        # ✅ 简化子命令解析逻辑 - 合并为单个布尔表达式
+        is_update = (sub and sub.lower() in ("update", "更新")) or \
+                    (not sub and event.message_str.strip().lower() in ("/更新", "更新"))
+        
+        if is_update:
+            async for r in self._handle_update_command(event):
+                yield r
+        else:
+            async for r in self._send_random_pig(event):
+                yield r
+
+    @filter.command("更新")
+    async def update_command(self, event: AstrMessageEvent):
+        """别名: 更新猪猪列表"""
+        async for r in self._handle_update_command(event, force=True):
+            yield r
+
+    # ══════════════════════════════════════════
+    #  关键词触发（可选）
+    # ══════════════════════════════════════════
+
+    @filter.event_message_type("message")
+    async def on_message(self, event: AstrMessageEvent):
+        """监听消息触发关键词 - 仅在配置启用时生效"""
+        if not self.is_match_all_msg:
+            return
+        
+        message = self._clean_text(getattr(event, "message_str", "") or "")
+        if not message or not self._is_trigger_keyword(message):
+            return
+        
+        # 避免响应自己的消息或命令
+        if message.startswith(("/", "／")):
+            return
+            
+        # 发送猪猪（不占用命令冷却）
+        img_path = await self._get_random_pig_image()
+        if img_path and os.path.exists(img_path):
+            await event.send(MessageChain().image(img_path))
+
+    # ══════════════════════════════════════════
+    #  帮助信息
+    # ══════════════════════════════════════════
+
+    @filter.command("pig help")
+    @filter.command("猪猪帮助")
+    async def help_command(self, event: AstrMessageEvent):
+        """显示帮助信息"""
+        help_text = """🐷 猪猪表情包插件帮助
+        【命令】
+        /pig          - 随机发送一张猪猪
+        /pig update   - 手动更新猪猪列表
+        /更新         - 同上
+        /pig help     - 显示此帮助
+
+        【配置】
+        cooldown_period: 指令冷却时间(秒)
+        load_to_local: 是否缓存图片到本地
+        update_cycle: 自动更新周期(天), 0=禁用
+        is_match_all_msg: 是否监听关键词自动回复
+        match_keywords: 触发关键词列表
+
+        【说明】
+        • 图片源: jsDelivr CDN
+        • 支持本地缓存减少流量
+        • 自动处理月末/年末日期计算
+        
+        作者: SakuraMikku
+        仓库: https://github.com/wuxinTLH/astrbot_plugin_pig"""
+        yield event.plain_result(help_text)
