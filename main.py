@@ -18,7 +18,7 @@ from astrbot.api import AstrBotConfig, logger
 from astrbot.core.utils.io import download_image_by_url
 
 
-@register("astrbot_plugin_pig", "SakuraMikku", "随机发送猪相关图片", "0.1.1")
+@register("astrbot_plugin_pig", "SakuraMikku", "随机发送猪相关图片", "0.1.2")
 class PigRandomImagePlugin(Star):
 
     # ══════════════════════════════════════════
@@ -639,34 +639,34 @@ class PigRandomImagePlugin(Star):
         async for r in self._get_random_pig_image(event):
             yield r
 
-    @filter.event_message_type(filter.EventMessageType.GROUP_MESSAGE)
-    async def keyword_trigger(self, event: AstrMessageEvent):
-        message_str = event.message_str
-        if not message_str:
-            return
+    # @filter.event_message_type(filter.EventMessageType.GROUP_MESSAGE)
+    # async def keyword_trigger(self, event: AstrMessageEvent):
+    #     message_str = event.message_str
+    #     if not message_str:
+    #         return
 
-        msg = message_str.strip()
+    #     msg = message_str.strip()
 
-        # ── 去重：已被 pig_command 或 pig_alias_command 处理的消息不重复触发 ──
-        # pig_command 覆盖：/pig /Pig /PIG pig PIG 等（含可选子命令）
-        if re.match(r"(?i)^[/／]?pig(\s+.*)?$", msg):
-            return
-        # pig_alias_command 覆盖：猪 / 祝 / 猪猪 / 猪猪图（精确）
-        if re.match(r"^(?:猪|祝|猪猪|猪猪图)$", msg):
-            return
-        # exclude_prefixes：命令前缀开头一律排除
-        if message_str.startswith(self.exclude_prefixes):
-            return
+    #     # ── 去重：已被 pig_command 或 pig_alias_command 处理的消息不重复触发 ──
+    #     # pig_command 覆盖：/pig /Pig /PIG pig PIG 等（含可选子命令）
+    #     if re.match(r"(?i)^[/／]?pig(\s+.*)?$", msg):
+    #         return
+    #     # pig_alias_command 覆盖：猪 / 祝 / 猪猪 / 猪猪图（精确）
+    #     if re.match(r"^(?:猪|祝|猪猪|猪猪图)$", msg):
+    #         return
+    #     # exclude_prefixes：命令前缀开头一律排除
+    #     if message_str.startswith(self.exclude_prefixes):
+    #         return
 
-        if self.is_match_all_msg:
-            # 匹配所有消息模式：不检查关键词，直接触发
-            async for r in self._get_random_pig_image(event):
-                yield r
-        else:
-            # 默认模式：仅当消息命中 match_keywords 才触发
-            if self._is_trigger_keyword(message_str, self.match_keywords):
-                async for r in self._get_random_pig_image(event):
-                    yield r
+    #     if self.is_match_all_msg:
+    #         # 匹配所有消息模式：不检查关键词，直接触发
+    #         async for r in self._get_random_pig_image(event):
+    #             yield r
+    #     else:
+    #         # 默认模式：仅当消息命中 match_keywords 才触发
+    #         if self._is_trigger_keyword(message_str, self.match_keywords):
+    #             async for r in self._get_random_pig_image(event):
+    #                 yield r
 
     def _is_trigger_keyword(self, message: str, keywords: List[str]) -> bool:
         """
