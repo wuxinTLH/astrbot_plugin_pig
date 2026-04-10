@@ -20,9 +20,15 @@ from astrbot.core.utils.io import download_image_by_url
 
 @register("astrbot_plugin_pig", "SakuraMikku", "随机发送猪相关图片", "0.1.1")
 class PigRandomImagePlugin(Star):
+
+    # ══════════════════════════════════════════
+    #  初始化
+    # ══════════════════════════════════════════
+
     def __init__(self, context: Context, config: AstrBotConfig):
         super().__init__(context, config)
 
+        # ── 配置读取（带类型转换和默认值）──
         try:
             self.cooldown_period = float(config.get("cooldown_period", 5))
         except Exception:
@@ -41,11 +47,15 @@ class PigRandomImagePlugin(Star):
             self.update_cycle = 0
 
         try:
+            # is_match_all_msg=True：只要消息不以 exclude_prefixes 开头就回复，不再检查关键词
+            # is_match_all_msg=False（默认）：仅当消息命中 match_keywords 时回复
             self.is_match_all_msg = bool(config.get("is_match_all_msg", False))
         except Exception:
             self.is_match_all_msg = False
 
         try:
+            # is_exact_match=True：消息整体等于关键词才触发（精确匹配）
+            # is_exact_match=False：消息包含关键词即触发（模糊匹配）
             self.is_exact_match = bool(config.get("is_exact_match", True))
         except Exception:
             self.is_exact_match = True
@@ -67,6 +77,9 @@ class PigRandomImagePlugin(Star):
         self.local_img_dir = os.path.join(base_dir, "imgs", "pig")
         self.json_path = os.path.join(base_dir, "list.json")
 
+        # ── 内存状态 ──
+        # FIX-1：冷却表 key 改为 (user_id, group_id) 元组，实现用户级隔离
+        # 原版：Dict[str, float]，全部用 "pig" 作 key，所有用户共用同一冷却
         self.last_called_times: Dict[Tuple[str, str], float] = {}
         self.pig_images: List[Dict[str, Any]] = []
 
@@ -74,11 +87,17 @@ class PigRandomImagePlugin(Star):
         self._download_semaphore = asyncio.Semaphore(3)
         self._update_lock = asyncio.Lock()
         self._scheduler_task: Optional[asyncio.Task] = None
+
+        # FIX-PERF：全局复用 aiohttp session，避免每次请求重新建立连接
+        # 原版：_fetch_remote_images 内每次都 async with aiohttp.ClientSession(...)
         self._http_session: Optional[aiohttp.ClientSession] = None
 
         self._create_local_dir()
         self._load_pig_from_json()
 
+    # ══════════════════════════════════════════
+    #  生命周期
+    # ══════════════════════════════════════════
 
     async def initialize(self):
         # 创建全局 HTTP session
@@ -115,6 +134,8 @@ class PigRandomImagePlugin(Star):
         )
 
     async def terminate(self):
+        # FIX-7：terminate 中先 cancel 再 await，直接捕获 CancelledError
+        # 原版：cancel() 后再 wait_for()，wait_for 在已取消任务上是冗余且误导性的
         if self._scheduler_task and not self._scheduler_task.done():
             self._scheduler_task.cancel()
             try:
@@ -134,6 +155,9 @@ class PigRandomImagePlugin(Star):
 
         logger.info("[Pig] 插件已卸载")
 
+    # ══════════════════════════════════════════
+    #  工具函数
+    # ══════════════════════════════════════════
 
     def _create_local_dir(self):
         if not self.load_to_local:
@@ -196,6 +220,8 @@ class PigRandomImagePlugin(Star):
 
         return user_id, group_id
 
+    # FIX-1：冷却检查改为接受 identity 元组
+    # 原版：接受 command_name: str，调用方传 "pig"，全局共享
     def _is_on_cooldown(self, identity: Tuple[str, str]) -> Tuple[bool, float]:
         last = self.last_called_times.get(identity, 0.0)
         remaining = self.cooldown_period - (time.time() - last)
@@ -204,6 +230,9 @@ class PigRandomImagePlugin(Star):
     def _is_valid_image_suffix(self, filename: str) -> bool:
         return filename.lower().endswith((".jpg", ".jpeg", ".png", ".gif", ".bmp", ".webp"))
 
+    # ══════════════════════════════════════════
+    #  JSON 加载 / 远程更新
+    # ══════════════════════════════════════════
 
     def _load_pig_from_json(self):
         if not os.path.exists(self.json_path):
@@ -272,6 +301,8 @@ class PigRandomImagePlugin(Star):
     async def _fetch_remote_images(self) -> Optional[Dict]:
         """从 pighub.top 拉取最新图片列表。复用全局 session（如可用）。"""
         url = "https://pighub.top/api/images?limit=10000&sort=latest"
+        # FIX-PERF：优先复用全局 session；session 不可用时临时创建
+        # 原版：每次都 async with aiohttp.ClientSession(...) 新建连接
         if self._http_session and not self._http_session.closed:
             session = self._http_session
             own_session = False
@@ -337,6 +368,9 @@ class PigRandomImagePlugin(Star):
                 pass
             return False
 
+    # ══════════════════════════════════════════
+    #  下载与本地缓存
+    # ══════════════════════════════════════════
 
     async def _get_local_image(self, selected_img: Dict) -> Optional[str]:
         img_filename = selected_img.get("filename")
@@ -443,8 +477,13 @@ class PigRandomImagePlugin(Star):
                 except Exception:
                     pass
 
+    # ══════════════════════════════════════════
+    #  随机猪图主逻辑
+    # ══════════════════════════════════════════
 
     async def _get_random_pig_image(self, event: AstrMessageEvent):
+        # FIX-1：冷却改为用户级 identity，不同用户独立冷却
+        # 原版：command_name = "pig"，所有用户共享
         identity = self._get_identity(event)
         on_cooldown, remaining = self._is_on_cooldown(identity)
         if on_cooldown:
@@ -455,6 +494,9 @@ class PigRandomImagePlugin(Star):
             yield event.plain_result("无可用猪图数据")
             return
 
+        # FIX-4：修复随机去重逻辑
+        # 原版：continue 后 for 循环变量继续推进，实际不能保证跳过重复 idx
+        # 修复：用 random.sample 直接取不重复候选下标列表
         pool_size = len(self.pig_images)
         max_candidates = min(pool_size, 5)
         candidates = random.sample(range(pool_size), max_candidates)
@@ -491,11 +533,16 @@ class PigRandomImagePlugin(Star):
         yield event.plain_result("获取猪图失败，请稍后重试")
         self.last_called_times[identity] = time.time()
 
+    # ══════════════════════════════════════════
+    #  后台定时更新
+    # ══════════════════════════════════════════
 
     async def _update_cycle_task(self):
         """按 update_cycle（天）周期在每日零点检查并更新图片列表。"""
         try:
             while True:
+                # FIX-5：改用 datetime 计算零点，避免 tm_mday+1 月末溢出和夏令时偏差
+                # 原版：time.mktime((... lt.tm_mday + 1 ...)) 月末可能产生偏差
                 now = datetime.now()
                 next_midnight = datetime.combine(
                     (now + timedelta(days=1)).date(),
@@ -534,6 +581,9 @@ class PigRandomImagePlugin(Star):
         finally:
             logger.info("[Pig] 调度任务退出")
 
+    # ══════════════════════════════════════════
+    #  手动更新逻辑（抽取为独立方法，供命令复用）
+    # ══════════════════════════════════════════
 
     async def _do_manual_update(self, event: AstrMessageEvent):
         async with self._update_lock:
@@ -549,6 +599,14 @@ class PigRandomImagePlugin(Star):
                 logger.error(f"[Pig] 手动更新异常：{e}")
                 yield event.plain_result(f"[Pig] 手动更新失败：{e}")
 
+    # ══════════════════════════════════════════
+    #  命令绑定
+    # ══════════════════════════════════════════
+
+    # ── pig 主指令（大小写不敏感）─────────────────────────────────────────────
+    # filter.regex + (?i) 替代原版 filter.command("pig")
+    # /pig  /Pig  /PIG  /pIg  pig  PIG（前缀 / 可选，大小写任意）
+    # 支持子命令：/pig update | /pig 更新
     @filter.regex(r"(?i)^[/／]?pig(?:\s+(update|更新))?$")
     async def pig_command(self, event: AstrMessageEvent):
         """
@@ -568,6 +626,13 @@ class PigRandomImagePlugin(Star):
         async for r in self._get_random_pig_image(event):
             yield r
 
+    # ── 原版 alias={"猪","祝","猪猪","猪猪图"} 保留 ───────────────────────────
+    # 原版写法：filter.command("pig", alias={"猪","祝","猪猪","猪猪图"})
+    # alias 在 AstrBot 里是精确前缀匹配，对这四个中文词功能正常。
+    # 此处改为独立 filter.regex，精确匹配整条消息等于这些词的情况，
+    # 与下方 keyword_trigger 的"包含匹配"形成互补：
+    #   独立发"猪" / "祝" / "猪猪" / "猪猪图"           → pig_alias_command（精确）
+    #   发"今天天气真好猪猪"（is_exact_match=False 时） → keyword_trigger（包含）
     @filter.regex(r"^(?:猪|祝|猪猪|猪猪图)$")
     async def pig_alias_command(self, event: AstrMessageEvent):
         """原版 alias 中文指令：猪 / 祝 / 猪猪 / 猪猪图（精确消息触发，保持原有行为）"""
@@ -580,16 +645,25 @@ class PigRandomImagePlugin(Star):
         if not message_str:
             return
 
-        # 命令前缀开头的消息不走关键词触发（避免与 /pig 命令重复响应）
+        msg = message_str.strip()
+
+        # ── 去重：已被 pig_command 或 pig_alias_command 处理的消息不重复触发 ──
+        # pig_command 覆盖：/pig /Pig /PIG pig PIG 等（含可选子命令）
+        if re.match(r"(?i)^[/／]?pig(\s+.*)?$", msg):
+            return
+        # pig_alias_command 覆盖：猪 / 祝 / 猪猪 / 猪猪图（精确）
+        if re.match(r"^(?:猪|祝|猪猪|猪猪图)$", msg):
+            return
+        # exclude_prefixes：命令前缀开头一律排除
         if message_str.startswith(self.exclude_prefixes):
             return
 
         if self.is_match_all_msg:
-            # 开启"匹配所有消息"模式：直接触发，无需检查关键词
+            # 匹配所有消息模式：不检查关键词，直接触发
             async for r in self._get_random_pig_image(event):
                 yield r
         else:
-            # 默认模式：仅当消息命中关键词时触发
+            # 默认模式：仅当消息命中 match_keywords 才触发
             if self._is_trigger_keyword(message_str, self.match_keywords):
                 async for r in self._get_random_pig_image(event):
                     yield r
