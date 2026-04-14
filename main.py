@@ -18,7 +18,7 @@ from astrbot.api import AstrBotConfig, logger
 from astrbot.core.utils.io import download_image_by_url
 
 
-@register("astrbot_plugin_pig", "SakuraMikku", "随机发送猪相关图片", "0.1.1")
+@register("astrbot_plugin_pig", "SakuraMikku", "随机发送猪相关图片", "0.1.4-t")
 class PigRandomImagePlugin(Star):
 
     # ══════════════════════════════════════════
@@ -599,14 +599,6 @@ class PigRandomImagePlugin(Star):
                 logger.error(f"[Pig] 手动更新异常：{e}")
                 yield event.plain_result(f"[Pig] 手动更新失败：{e}")
 
-    # ══════════════════════════════════════════
-    #  命令绑定
-    # ══════════════════════════════════════════
-
-    # ── pig 主指令（大小写不敏感）─────────────────────────────────────────────
-    # filter.regex + (?i) 替代原版 filter.command("pig")
-    # /pig  /Pig  /PIG  /pIg  pig  PIG（前缀 / 可选，大小写任意）
-    # 支持子命令：/pig update | /pig 更新
     @filter.regex(r"(?i)^[/／]?pig(?:\s+(update|更新))?$")
     async def pig_command(self, event: AstrMessageEvent):
         """
@@ -626,54 +618,32 @@ class PigRandomImagePlugin(Star):
         async for r in self._get_random_pig_image(event):
             yield r
 
-    # ── 原版 alias={"猪","祝","猪猪","猪猪图"} 保留 ───────────────────────────
-    # 原版写法：filter.command("pig", alias={"猪","祝","猪猪","猪猪图"})
-    # alias 在 AstrBot 里是精确前缀匹配，对这四个中文词功能正常。
-    # 此处改为独立 filter.regex，精确匹配整条消息等于这些词的情况，
-    # 与下方 keyword_trigger 的"包含匹配"形成互补：
-    #   独立发"猪" / "祝" / "猪猪" / "猪猪图"           → pig_alias_command（精确）
-    #   发"今天天气真好猪猪"（is_exact_match=False 时） → keyword_trigger（包含）
     @filter.regex(r"^(?:猪|祝|猪猪|猪猪图)$")
     async def pig_alias_command(self, event: AstrMessageEvent):
         """原版 alias 中文指令：猪 / 祝 / 猪猪 / 猪猪图（精确消息触发，保持原有行为）"""
         async for r in self._get_random_pig_image(event):
             yield r
 
-    @filter.event_message_type(filter.EventMessageType.GROUP_MESSAGE)
-    async def keyword_trigger(self, event: AstrMessageEvent):
-        message_str = event.message_str
-        if not message_str:
-            return
+    # @filter.event_message_type(filter.EventMessageType.GROUP_MESSAGE)
+    # async def keyword_trigger(self, event: AstrMessageEvent):
+    #     if self.is_match_all_msg:
+    #         message_str = event.message_str
+    #         if not message_str:
+    #             return
+    #         if message_str.startswith(self.exclude_prefixes):
+    #             return
+    #         if self._is_trigger_keyword(message_str, self.match_keywords):
+    #             async for r in self._get_random_pig_image(event):
+    #                 yield r
 
-        msg = message_str.strip()
-
-        # ── 去重：已被 pig_command 或 pig_alias_command 处理的消息不重复触发 ──
-        # pig_command 覆盖：/pig /Pig /PIG pig PIG 等（含可选子命令）
-        if re.match(r"(?i)^[/／]?pig(\s+.*)?$", msg):
-            return
-        # pig_alias_command 覆盖：猪 / 祝 / 猪猪 / 猪猪图（精确）
-        if re.match(r"^(?:猪|祝|猪猪|猪猪图)$", msg):
-            return
-        # exclude_prefixes：命令前缀开头一律排除
-        if message_str.startswith(self.exclude_prefixes):
-            return
-
-        if self.is_match_all_msg:
-            # 匹配所有消息模式：不检查关键词，直接触发
-            async for r in self._get_random_pig_image(event):
-                yield r
-        else:
-            # 默认模式：仅当消息命中 match_keywords 才触发
-            if self._is_trigger_keyword(message_str, self.match_keywords):
-                async for r in self._get_random_pig_image(event):
-                    yield r
-
-    def _is_trigger_keyword(self, message: str, keywords: List[str]) -> bool:
-        """
-        精确匹配（is_exact_match=True）：消息去空白后与关键词完全相等
-        模糊匹配（is_exact_match=False）：消息包含关键词
-        """
-        msg = message.strip()
-        if self.is_exact_match:
-            return msg in keywords
-        return any(kw in message for kw in keywords)
+    def _is_trigger_keyword(self, message: str, keywords: list) -> bool:
+        """检查消息是否包含或等于触发关键词"""
+        # 完全匹配
+        if message.strip() in keywords:
+            return True
+        if not self.is_exact_match:
+            # 或者消息中包含关键词
+            for keyword in keywords:
+                if keyword in message:
+                    return True
+        return False
