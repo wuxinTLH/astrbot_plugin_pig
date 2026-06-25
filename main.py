@@ -155,7 +155,7 @@ class PigRandomImagePlugin(Star):
         for img in raw_images:
             if not isinstance(img, dict):
                 continue
-            thumbnail = img.get("thumbnail", "")
+            thumbnail = img.get("thumbnail") or img.get("image_url") or img.get("url") or ""
             if not thumbnail:
                 logger.warning(f"跳过空thumbnail图片：{img.get('title', '未知')}")
                 continue
@@ -187,7 +187,7 @@ class PigRandomImagePlugin(Star):
                 title_part = img.get("title", "未知图片")
                 img_filename = self._sanitize_filename(f"{title_part}{file_ext}")
 
-            valid_suffixes = (".jpg", ".jpeg", ".png", ".gif", ".bmp")
+            valid_suffixes = (".jpg", ".jpeg", ".png", ".gif", ".bmp", ".webp")
             if not img_filename.lower().endswith(valid_suffixes):
                 img_filename = img_filename + ".jpg"
 
@@ -201,12 +201,19 @@ class PigRandomImagePlugin(Star):
         logger.info(f"图片配置加载成功，共{len(self.pig_images)}张图片（v0.0.9，支持远程更新）")
 
     async def _fetch_remote_images(self):
-        url = "https://pighub.top/api/images?limit=10000&sort=latest"
+        url = "https://pighub.top/api/images?sort=2"
         try:
             async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=10)) as session:
                 async with session.get(url) as response:
                     if response.status == 200:
-                        return await response.json()
+                        data = await response.json()
+                        if not isinstance(data, dict):
+                            logger.error("远程猪图接口返回格式错误：非JSON对象")
+                            return None
+                        if data.get("code") != 0 or not isinstance(data.get("data"), list) or not data.get("data"):
+                            logger.error("远程猪图接口返回无效：%s", data)
+                            return None
+                        return {"images": data["data"]}
                     logger.error(f"远程请求失败，状态码：{response.status}")
                     return None
         except Exception as e:
@@ -215,6 +222,10 @@ class PigRandomImagePlugin(Star):
 
     def _apply_remote_data_if_needed(self, remote_data):
         if not isinstance(remote_data, dict):
+            return False
+        remote_images = remote_data.get("images")
+        if not isinstance(remote_images, list) or not remote_images:
+            logger.error("远程猪图数据无效，拒绝更新本地 list.json：%s", remote_data)
             return False
 
         local_data = None
@@ -240,7 +251,7 @@ class PigRandomImagePlugin(Star):
         if not local_data:
             need_update = True
         else:
-            if local_ids != remote_ids or len(local_data.get("images", [])) != len(remote_data.get("images", [])):
+            if local_ids != remote_ids or len(local_data.get("images", [])) != len(remote_images):
                 need_update = True
 
         if not need_update:
@@ -298,7 +309,7 @@ class PigRandomImagePlugin(Star):
         return elapsed_time < self.cooldown_period, max(0, self.cooldown_period - elapsed_time)
 
     def _is_valid_image_suffix(self, filename: str) -> bool:
-        valid_suffixes = (".jpg", ".jpeg", ".png", ".gif", ".bmp")
+        valid_suffixes = (".jpg", ".jpeg", ".png", ".gif", ".bmp", ".webp")
         return filename.lower().endswith(valid_suffixes)
 
     async def _get_local_image(self, selected_img):
