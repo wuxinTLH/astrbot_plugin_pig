@@ -15,22 +15,34 @@ from astrbot.api.star import Context, Star, register
 from astrbot.api import AstrBotConfig, logger
 from astrbot.core.utils.io import download_image_by_url
 
-@register("astrbot_plugin_pig", "SakuraMikku", "随机发送猪相关图片", "0.1.4")
+PIGHUB_BASE = "https://pighub.top"
+PIGHUB_API  = "https://pighub.top/api/images?sort=2&limit=10000"
+
+# 图片实际下载走 GitHub raw（pighub 直链被 WAF 拦截，GitHub raw 可正常访问）
+GHRAW_BASE  = "https://raw.githubusercontent.com/BadFish-HSrui/PigHub-DB/master/data/"
+
+# 支持的图片后缀（从文件名中识别）
+_VALID_EXT = (".jpg", ".jpeg", ".png", ".gif", ".bmp", ".webp",
+              ".avif", ".tiff", ".tif", ".svg", ".ico")
+
+
+@register("astrbot_plugin_pig", "SakuraMikku", "随机发送猪相关图片", "0.1.5")
 class PigRandomImagePlugin(Star):
     def __init__(self, context: Context, config: AstrBotConfig):
         super().__init__(context, config)
-        # 配置项（带类型转换和默认）
+
         try:
             self.cooldown_period = float(config.get("cooldown_period", 5))
         except Exception:
             self.cooldown_period = 5.0
+
         self.load_to_local = bool(config.get("load_to_local", False))
+
         try:
             self.max_retries = int(config.get("max_retries", 2))
         except Exception:
             self.max_retries = 2
 
-        # 更新周期（按天），0 表示不自动更新
         try:
             self.update_cycle = int(config.get("update_cycle", 0))
             if self.update_cycle < 0:
@@ -38,28 +50,21 @@ class PigRandomImagePlugin(Star):
         except Exception:
             self.update_cycle = 0
 
-        # 是否试图匹配所有消息
         try:
             self.is_match_all_msg = bool(config.get("is_match_all_msg", False))
         except Exception:
             self.is_match_all_msg = False
 
-        # 是否精确匹配
         try:
             self.is_exact_match = bool(config.get("is_exact_match", True))
         except Exception:
             self.is_exact_match = True
 
-        # 匹配的关键词
         try:
             self.match_keywords = list(config.get("match_keywords", []))
         except Exception:
-            self.match_keywords = [
-                "猪", "祝",
-                "🐷", "🐖", "🐽",
-                "㊗", "㊗️",
-            ]
-        # 不进行匹配的前缀
+            self.match_keywords = ["猪", "祝", "🐷", "🐖", "🐽", "㊗", "㊗️"]
+
         try:
             self.exclude_prefixes = tuple(config.get("exclude_prefixes", ()))
         except Exception:
@@ -67,19 +72,20 @@ class PigRandomImagePlugin(Star):
 
         self.last_called_times: Dict[str, float] = {}
         self.pig_images: List[Dict[str, Any]] = []
+
         base_dir = os.path.dirname(__file__)
         self.local_img_dir = os.path.join(base_dir, "imgs", "pig")
-        self.json_path = os.path.join(base_dir, "list.json")
+        self.json_path     = os.path.join(base_dir, "list.json")
 
-        # 并发控制与锁
         self._download_semaphore = asyncio.Semaphore(3)
-        self._update_lock = asyncio.Lock()
+        self._update_lock        = asyncio.Lock()
         self._scheduler_task: Optional[asyncio.Task] = None
 
         self._create_local_dir()
         self._load_pig_from_json()
 
-    # -------------------- 工具 --------------------
+    # ── 工具 ──────────────────────────────────────────────────────────────
+
     def _create_local_dir(self):
         if not self.load_to_local:
             return
@@ -88,35 +94,27 @@ class PigRandomImagePlugin(Star):
             logger.info(f"本地图片目录初始化完成：{self.local_img_dir}")
         except OSError as e:
             self.load_to_local = False
-            logger.error(f"创建图片目录失败：{str(e)}，已切换为仅网络加载")
+            logger.error(f"创建图片目录失败：{e}，已切换为仅网络加载")
 
     def _sanitize_filename(self, name: str, default: str = "image") -> str:
         if not name:
             name = default
-        name = name.replace("\x00", "")
-        name = name.replace("/", "_").replace("\\", "_")
+        name = name.replace("\x00", "").replace("/", "_").replace("\\", "_")
         allowed = set("-_.() ")
-        cleaned_chars: List[str] = []
+        cleaned = []
         for ch in name:
             if ch.isalnum() or ch in allowed:
-                cleaned_chars.append(ch)
-                continue
-            o = ord(ch)
-            if 0x4e00 <= o <= 0x9fff:
-                cleaned_chars.append(ch)
-                continue
-            cleaned_chars.append("_")
-        cleaned = "".join(cleaned_chars).strip()
-        MAX_LEN = 200
-        if len(cleaned) > MAX_LEN:
-            cleaned = cleaned[:MAX_LEN]
-        if cleaned == "":
-            cleaned = default
-        return cleaned
+                cleaned.append(ch)
+            elif 0x4E00 <= ord(ch) <= 0x9FFF:
+                cleaned.append(ch)
+            else:
+                cleaned.append("_")
+        result = "".join(cleaned).strip()[:200]
+        return result or default
 
-    def _quote_path_preserving_slashes(self, path: str) -> str:
-        segments = path.split("/")
-        return "/".join(urllib.parse.quote(seg) for seg in segments)
+    def _quote_path(self, path: str) -> str:
+        """对 URL 路径各段做 percent-encoding（保留斜杠）。"""
+        return "/".join(urllib.parse.quote(seg) for seg in path.split("/"))
 
     def _is_valid_url(self, url: str) -> bool:
         try:
@@ -125,28 +123,57 @@ class PigRandomImagePlugin(Star):
         except Exception:
             return False
 
+    def _is_valid_img_suffix(self, filename: str) -> bool:
+        return filename.lower().endswith(_VALID_EXT)
+
+    def _detect_ext(self, filename: str) -> str:
+        """从文件名中提取后缀；若无已知后缀则返回 .jpg 兜底。"""
+        _, ext = os.path.splitext(filename)
+        return ext.lower() if ext.lower() in _VALID_EXT else ".jpg"
+
     def _clean_text(self, text: str) -> str:
         if not isinstance(text, str):
             return ""
         text = re.sub(r"\[At:[^\]]+\]", "", text)
         text = re.sub(r"<at[^>]*>.*?</at>", "", text, flags=re.I | re.S)
-        text = text.strip()
-        text = text.lstrip("/\\／﹨")
-        text = re.sub(r"\s+", " ", text)
-        return text.strip()
+        return re.sub(r"\s+", " ", text.strip().lstrip("/\\／﹨")).strip()
 
-    # -------------------- JSON 加载/更新 --------------------
+    def _build_full_url(self, image_url: str) -> Optional[str]:
+        """
+        将 API 返回的 image_url 字段（形如 '/images/叉烧….jpg'）
+        拼成可直接下载的完整 URL，并对路径做 percent-encoding。
+        """
+        if not image_url:
+            return None
+        image_url = str(image_url)
+        if self._is_valid_url(image_url):
+            raw = image_url
+        else:
+            raw = PIGHUB_BASE + "/" + image_url.lstrip("/")
+        try:
+            p = urllib.parse.urlparse(raw)
+            encoded = urllib.parse.urlunparse(
+                (p.scheme, p.netloc, self._quote_path(p.path),
+                 p.params, p.query, p.fragment)
+            )
+            return encoded
+        except Exception:
+            return None
+
+    # ── JSON 加载 ──────────────────────────────────────────────────────────
+    # list.json 格式：{"images": [{"id", "title", "filename", "image_url", ...}, ...]}
+    # 与 pighub API 的 data 数组格式完全一致，直接存储 data 数组即可。
+
     def _load_pig_from_json(self):
         if not os.path.exists(self.json_path):
             logger.info("list.json 不存在，跳过本地加载")
             self.pig_images = []
             return
-
         try:
             with open(self.json_path, "r", encoding="utf-8") as f:
                 json_data = json.load(f)
         except Exception as e:
-            logger.error(f"加载list.json失败（解析或读取错误）：{e}")
+            logger.error(f"加载 list.json 失败：{e}")
             self.pig_images = []
             return
 
@@ -155,66 +182,78 @@ class PigRandomImagePlugin(Star):
         for img in raw_images:
             if not isinstance(img, dict):
                 continue
-            thumbnail = img.get("thumbnail", "")
-            if not thumbnail:
-                logger.warning(f"跳过空thumbnail图片：{img.get('title', '未知')}")
+
+            # 文件名：优先 filename 字段，否则从 image_url 路径推断
+            image_url_field = img.get("image_url", "")
+            filename = img.get("filename") or os.path.basename(image_url_field)
+            filename = self._sanitize_filename(str(filename))
+            if not filename:
+                logger.warning(f"跳过无效条目：{img.get('title', '未知')}")
                 continue
+            if not self._is_valid_img_suffix(filename):
+                filename += ".jpg"
 
-            thumbnail = str(thumbnail).lstrip("/")
-            base_url = "https://pighub.top/"
-            if self._is_valid_url(thumbnail):
-                unencoded_url = thumbnail
-            else:
-                unencoded_url = urllib.parse.urljoin(base_url, thumbnail)
-
-            try:
-                parsed = urllib.parse.urlparse(unencoded_url)
-                encoded_path = self._quote_path_preserving_slashes(parsed.path)
-                encoded_full_url = urllib.parse.urlunparse(
-                    (parsed.scheme, parsed.netloc, encoded_path, parsed.params, parsed.query, parsed.fragment)
-                )
-            except Exception:
-                logger.debug(f"构建图片 URL 失败，跳过：{unencoded_url}")
-                continue
-
-            img_filename = img.get("filename")
-            if img_filename:
-                img_filename = self._sanitize_filename(str(img_filename))
-            else:
-                file_ext = os.path.splitext(thumbnail)[-1] or ".jpg"
-                if not file_ext or "." not in file_ext:
-                    file_ext = ".jpg"
-                title_part = img.get("title", "未知图片")
-                img_filename = self._sanitize_filename(f"{title_part}{file_ext}")
-
-            valid_suffixes = (".jpg", ".jpeg", ".png", ".gif", ".bmp")
-            if not img_filename.lower().endswith(valid_suffixes):
-                img_filename = img_filename + ".jpg"
+            # 图片下载走 GitHub raw（pighub 直链被 WAF 拦截，API 列表接口不受影响）
+            encoded_filename = urllib.parse.quote(filename, safe="")
+            full_url = GHRAW_BASE + encoded_filename
 
             self.pig_images.append({
-                "title": img.get("title", "随机猪图"),
-                "full_url": encoded_full_url,
-                "filename": img_filename,
-                "id": img.get("id")
+                "title":    img.get("title", "随机猪图"),
+                "full_url": full_url,
+                "filename": filename,
+                "id":       img.get("id"),
             })
 
-        logger.info(f"图片配置加载成功，共{len(self.pig_images)}张图片（v0.0.9，支持远程更新）")
+        logger.info(f"图片配置加载成功，共 {len(self.pig_images)} 张")
 
-    async def _fetch_remote_images(self):
-        url = "https://pighub.top/api/images?limit=10000&sort=latest"
+    # ── 远程拉取 & 更新 ────────────────────────────────────────────────────
+
+    async def _fetch_remote_images(self) -> Optional[dict]:
+        """
+        请求 pighub API，返回标准化后的 {"images": [...]} 结构；
+        失败返回 None。
+
+        API 响应结构：
+          {"code": 0, "message": "OK", "data": [{id, title, filename, image_url, ...}]}
+        """
         try:
-            async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=10)) as session:
-                async with session.get(url) as response:
-                    if response.status == 200:
-                        return await response.json()
-                    logger.error(f"远程请求失败，状态码：{response.status}")
-                    return None
+            timeout = aiohttp.ClientTimeout(total=15)
+            async with aiohttp.ClientSession(
+                timeout=timeout, trust_env=True
+            ) as sess:
+                async with sess.get(PIGHUB_API) as resp:
+                    if resp.status != 200:
+                        logger.error(f"远程请求失败，状态码：{resp.status}")
+                        return None
+                    payload = await resp.json(content_type=None)
+
+            if not isinstance(payload, dict):
+                logger.error("远程响应非 JSON 对象")
+                return None
+            if payload.get("code") != 0:
+                logger.error(f"远程接口返回错误：code={payload.get('code')}, message={payload.get('message')}")
+                return None
+            data = payload.get("data")
+            if not isinstance(data, list) or not data:
+                logger.error("远程接口 data 字段为空或格式错误")
+                return None
+
+            logger.info(f"远程接口返回 {len(data)} 张图片")
+            return {"images": data}
+
+        except asyncio.TimeoutError:
+            logger.error("远程请求超时")
+            return None
         except Exception as e:
-            logger.error(f"远程请求异常：{str(e)}")
+            logger.error(f"远程请求异常：{e}")
             return None
 
-    def _apply_remote_data_if_needed(self, remote_data):
+    def _apply_remote_data_if_needed(self, remote_data: dict) -> bool:
         if not isinstance(remote_data, dict):
+            return False
+        remote_images = remote_data.get("images")
+        if not isinstance(remote_images, list) or not remote_images:
+            logger.error("远程数据无效，拒绝更新")
             return False
 
         local_data = None
@@ -226,156 +265,129 @@ class PigRandomImagePlugin(Star):
                 local_data = None
 
         def extract_ids(d):
-            if not d or not isinstance(d, dict):
+            if not isinstance(d, dict):
                 return set()
-            imgs = d.get("images")
-            if not imgs or not isinstance(imgs, list):
-                return set()
-            return {item.get("id") for item in imgs if isinstance(item, dict) and "id" in item}
+            imgs = d.get("images") or []
+            return {i.get("id") for i in imgs if isinstance(i, dict) and "id" in i}
 
-        local_ids = extract_ids(local_data)
+        local_ids  = extract_ids(local_data)
         remote_ids = extract_ids(remote_data)
-
-        need_update = False
-        if not local_data:
-            need_update = True
-        else:
-            if local_ids != remote_ids or len(local_data.get("images", [])) != len(remote_data.get("images", [])):
-                need_update = True
-
+        need_update = (
+            not local_data
+            or local_ids != remote_ids
+            or len((local_data or {}).get("images", [])) != len(remote_images)
+        )
         if not need_update:
             return False
 
-        tmp_path = f"{self.json_path}.tmp_{int(time.time())}_{random.randint(0, 10**9)}"
+        tmp = f"{self.json_path}.tmp_{int(time.time())}_{random.randint(0, 10**9)}"
         try:
-            with open(tmp_path, "w", encoding="utf-8") as f:
+            with open(tmp, "w", encoding="utf-8") as f:
                 json.dump(remote_data, f, ensure_ascii=False, indent=2)
-            os.replace(tmp_path, self.json_path)
-            logger.info("本地list.json已更新（远程变化），已保存到 %s", self.json_path)
+            os.replace(tmp, self.json_path)
+            logger.info("list.json 已更新（远程变化）")
             self._load_pig_from_json()
             return True
         except Exception as e:
-            logger.error("更新本地 list.json 失败（已记录）。")
-            logger.debug("更新 list.json 失败详情：%s", e)
+            logger.error(f"保存 list.json 失败：{e}")
             try:
-                if os.path.exists(tmp_path):
-                    os.remove(tmp_path)
+                os.path.exists(tmp) and os.remove(tmp)
             except Exception:
                 pass
             return False
+
+    # ── 初始化 ─────────────────────────────────────────────────────────────
 
     async def initialize(self):
         remote_data = await self._fetch_remote_images()
         if remote_data:
             try:
                 updated = self._apply_remote_data_if_needed(remote_data)
-                if updated:
-                    logger.info("初始化时已从远程更新本地列表")
-                else:
-                    logger.info("本地list.json与远程数据一致，无需更新（初始化检查）")
+                logger.info("初始化：" + ("已从远程更新本地列表" if updated else "本地列表已是最新"))
             except Exception as e:
-                logger.error(f"处理远程数据时出错：{str(e)}")
+                logger.error(f"处理远程数据时出错：{e}")
 
-        if self.update_cycle and self.update_cycle > 0:
+        if self.update_cycle > 0:
             if self._scheduler_task and not self._scheduler_task.done():
-                try:
-                    self._scheduler_task.cancel()
-                except Exception:
-                    pass
+                self._scheduler_task.cancel()
             self._scheduler_task = asyncio.create_task(self._update_cycle_task())
-            logger.info("已启动 list.json 后台更新调度器（周期：%d 天）", self.update_cycle)
+            logger.info(f"已启动后台更新调度（周期：{self.update_cycle} 天）")
         else:
-            logger.info("未启用 list.json 后台自动更新（update_cycle=0）")
+            logger.info("未启用后台自动更新（update_cycle=0）")
 
-        logger.info("猪图插件（v0.1.4-t，支持远程更新与定时检查）初始化完成，发送/pig获取图片")
-        logger.info(f"当前配置：冷却时间{self.cooldown_period}秒 | 本地加载{self.load_to_local} | 更新周期{self.update_cycle}天")
+        logger.info(
+            f"猪图插件 v0.1.5 初始化完成 | "
+            f"冷却 {self.cooldown_period}s | 本地缓存 {self.load_to_local} | "
+            f"更新周期 {self.update_cycle} 天 | 已加载 {len(self.pig_images)} 张"
+        )
 
-    # -------------------- 下载与缓存 --------------------
-    def _is_on_cooldown(self, command_name: str) -> Tuple[bool, float]:
-        current_time = time.time()
-        last_called = self.last_called_times.get(command_name, 0)
-        elapsed_time = current_time - last_called
-        return elapsed_time < self.cooldown_period, max(0, self.cooldown_period - elapsed_time)
+    # ── 下载与缓存 ─────────────────────────────────────────────────────────
 
-    def _is_valid_image_suffix(self, filename: str) -> bool:
-        valid_suffixes = (".jpg", ".jpeg", ".png", ".gif", ".bmp")
-        return filename.lower().endswith(valid_suffixes)
+    def _is_on_cooldown(self, key: str) -> Tuple[bool, float]:
+        elapsed = time.time() - self.last_called_times.get(key, 0)
+        return elapsed < self.cooldown_period, max(0.0, self.cooldown_period - elapsed)
 
-    async def _get_local_image(self, selected_img):
+    async def _get_local_image(self, selected_img: dict) -> Optional[str]:
         img_filename = selected_img.get("filename")
         if not img_filename:
             return None
-        local_img_path = os.path.join(self.local_img_dir, img_filename)
 
-        try:
-            local_abs = os.path.abspath(local_img_path)
-            base_abs = os.path.abspath(self.local_img_dir)
-            if not (local_abs == base_abs or local_abs.startswith(base_abs + os.sep)):
-                logger.warning("检测到可疑的本地路径，拒绝访问：%s", local_img_path)
-                return None
-        except Exception:
-            logger.warning("本地路径解析失败，跳过本地加载：%s", local_img_path)
+        local_abs = os.path.abspath(os.path.join(self.local_img_dir, img_filename))
+        base_abs  = os.path.abspath(self.local_img_dir)
+        if not local_abs.startswith(base_abs + os.sep):
+            logger.warning("可疑路径，拒绝：%s", local_abs)
             return None
 
-        if os.path.exists(local_abs) and self._is_valid_image_suffix(local_abs):
-            logger.info(f"使用本地图片：{img_filename}")
+        if os.path.exists(local_abs) and self._is_valid_img_suffix(local_abs):
+            logger.info(f"使用本地缓存：{img_filename}")
             return local_abs
 
-        logger.info(f"本地图片缺失，开始下载：{img_filename}")
+        logger.info(f"本地缺失，开始下载：{img_filename}")
         url = selected_img.get("full_url", "")
         if not self._is_valid_url(url):
-            logger.warning("图片 URL 无效，无法下载：%s", url)
             return None
 
         async with self._download_semaphore:
             try:
                 temp_path = await download_image_by_url(url)
             except Exception as e:
-                logger.error(f"调用 download_image_by_url 出错：{e}")
+                logger.error(f"download_image_by_url 出错：{e}")
                 temp_path = None
 
-        if not temp_path:
-            logger.error(f"网络下载失败，无法获取{img_filename}")
-            return None
-
-        temp_filename = os.path.basename(temp_path)
-        if not self._is_valid_image_suffix(temp_filename):
-            try:
-                os.remove(temp_path)
-            except Exception:
-                pass
-            logger.error(f"下载文件非图片格式，已清理：{temp_filename}")
+        if not temp_path or not self._is_valid_img_suffix(os.path.basename(temp_path)):
+            if temp_path:
+                try:
+                    os.remove(temp_path)
+                except Exception:
+                    pass
+            logger.error(f"下载失败或非图片格式：{img_filename}")
             return None
 
         try:
             os.makedirs(self.local_img_dir, exist_ok=True)
-            tmp_dest = os.path.join(self.local_img_dir, f".tmp_{int(time.time())}_{random.randint(0,10**9)}")
-            shutil.copy2(temp_path, tmp_dest)
-            os.replace(tmp_dest, local_abs)
-            logger.info(f"图片保存到本地：{local_abs}")
+            td = os.path.join(self.local_img_dir,
+                              f".tmp_{int(time.time())}_{random.randint(0, 10**9)}")
+            shutil.copy2(temp_path, td)
+            os.replace(td, local_abs)
+            logger.info(f"已缓存到本地：{local_abs}")
             return local_abs
         except Exception as e:
-            logger.error(f"保存本地失败：{str(e)}，将使用临时文件")
-            if os.path.exists(temp_path):
-                return temp_path
-            return None
+            logger.error(f"保存本地失败：{e}")
+            return temp_path if os.path.exists(temp_path) else None
 
-    async def _download_with_retries(self, url: str, title: str):
+    async def _download_with_retries(self, url: str, title: str) -> Optional[str]:
         if not self._is_valid_url(url):
-            logger.warning("尝试下载无效URL：%s", url)
+            logger.warning("无效 URL：%s", url)
             return None
 
-        attempt = 0
-        while attempt < max(1, self.max_retries):
-            attempt += 1
+        for attempt in range(1, max(1, self.max_retries) + 1):
             async with self._download_semaphore:
                 try:
-                    logger.info(f"网络加载尝试{attempt}/{self.max_retries}：{title}")
+                    logger.info(f"下载尝试 {attempt}/{self.max_retries}：{title}")
                     temp_path = await download_image_by_url(url)
                     if not temp_path:
                         raise RuntimeError("download returned None")
-                    temp_filename = os.path.basename(temp_path)
-                    if not self._is_valid_image_suffix(temp_filename):
+                    if not self._is_valid_img_suffix(os.path.basename(temp_path)):
                         try:
                             os.remove(temp_path)
                         except Exception:
@@ -383,59 +395,12 @@ class PigRandomImagePlugin(Star):
                         raise RuntimeError("非图片格式")
                     return temp_path
                 except Exception as e:
-                    short_err = str(e)[:120]
-                    logger.debug(f"下载尝试失败（{attempt}/{self.max_retries}）：{short_err}")
+                    logger.debug(f"下载尝试 {attempt}/{self.max_retries} 失败：{str(e)[:120]}")
                     if attempt >= max(1, self.max_retries):
-                        logger.error(f"获取{title}失败：{short_err}")
+                        logger.error(f"获取 {title} 失败（共 {attempt} 次）")
                         return None
-                    backoff = (2 ** attempt) + random.random()
-                    await asyncio.sleep(backoff)
+                    await asyncio.sleep(min(2.0, 1.5 ** attempt))
         return None
-
-    async def _get_random_pig_image(self, event: AstrMessageEvent):
-        command_name = "pig"
-        on_cooldown, remaining = self._is_on_cooldown(command_name)
-        if on_cooldown:
-            yield event.plain_result(f"冷却中～还需{remaining:.0f}秒")
-            return
-
-        if not self.pig_images:
-            yield event.plain_result("无可用猪图数据")
-            return
-
-        tried = set()
-        max_candidates = min(len(self.pig_images), 3)
-        for _ in range(max_candidates):
-            idx = random.randrange(len(self.pig_images))
-            if idx in tried and len(tried) < len(self.pig_images):
-                continue
-            tried.add(idx)
-            selected_img = self.pig_images[idx]
-            img_title = selected_img.get("title", "随机猪图")
-
-            if self.load_to_local:
-                try:
-                    img_path = await self._get_local_image(selected_img)
-                    if img_path:
-                        yield event.image_result(img_path)
-                        self.last_called_times[command_name] = time.time()
-                        return
-                    logger.debug("本地加载失败，切换为网络加载")
-                except Exception as e:
-                    logger.error(f"本地加载出错：{str(e)}，切换为网络加载")
-
-            temp_path = await self._download_with_retries(selected_img.get("full_url", ""), img_title)
-            if temp_path:
-                yield event.image_result(temp_path)
-                self.last_called_times[command_name] = time.time()
-                if self.load_to_local:
-                    asyncio.create_task(self._save_to_local_cache_async(temp_path, selected_img.get("filename")))
-                return
-            else:
-                continue
-
-        yield event.plain_result("获取猪图失败，请稍后重试")
-        self.last_called_times[command_name] = time.time()
 
     async def _save_to_local_cache_async(self, downloaded_path: str, target_filename: str):
         if not downloaded_path:
@@ -443,74 +408,109 @@ class PigRandomImagePlugin(Star):
         try:
             if not target_filename:
                 target_filename = os.path.basename(downloaded_path)
-            safe_name = self._sanitize_filename(str(target_filename))
+            safe = self._sanitize_filename(str(target_filename))
             os.makedirs(self.local_img_dir, exist_ok=True)
-            dest_path = os.path.join(self.local_img_dir, safe_name)
-            tmp_dest = os.path.join(self.local_img_dir, f".tmp_{int(time.time())}_{random.randint(0, 10**9)}")
-            shutil.copy2(downloaded_path, tmp_dest)
-            os.replace(tmp_dest, dest_path)
-            logger.info("后台缓存图片至本地：%s", dest_path)
+            dest = os.path.join(self.local_img_dir, safe)
+            td   = os.path.join(self.local_img_dir,
+                                 f".tmp_{int(time.time())}_{random.randint(0, 10**9)}")
+            shutil.copy2(downloaded_path, td)
+            os.replace(td, dest)
+            logger.info("后台缓存完成：%s", dest)
         except Exception as e:
-            logger.debug("后台保存本地缓存失败：%s", e)
-            try:
-                if 'tmp_dest' in locals() and os.path.exists(tmp_dest):
-                    os.remove(tmp_dest)
-            except Exception:
-                pass
+            logger.debug("后台缓存失败：%s", e)
+
+    # ── 发图主流程 ─────────────────────────────────────────────────────────
+
+    async def _get_random_pig_image(self, event: AstrMessageEvent):
+        key = "pig"
+        on_cd, remaining = self._is_on_cooldown(key)
+        if on_cd:
+            yield event.plain_result(f"冷却中～还需 {remaining:.0f} 秒")
+            return
+
+        if not self.pig_images:
+            yield event.plain_result("无可用猪图数据，请稍后重试")
+            return
+
+        tried: set = set()
+        max_candidates = min(len(self.pig_images), 3)
+        for _ in range(max_candidates):
+            idx = random.randrange(len(self.pig_images))
+            if idx in tried and len(tried) < len(self.pig_images):
+                continue
+            tried.add(idx)
+            selected_img = self.pig_images[idx]
+            img_title    = selected_img.get("title", "随机猪图")
+
+            if self.load_to_local:
+                try:
+                    img_path = await self._get_local_image(selected_img)
+                    if img_path:
+                        yield event.image_result(img_path)
+                        self.last_called_times[key] = time.time()
+                        return
+                    logger.debug("本地加载失败，切换为网络加载")
+                except Exception as e:
+                    logger.error(f"本地加载出错：{e}")
+
+            temp_path = await self._download_with_retries(
+                selected_img.get("full_url", ""), img_title
+            )
+            if temp_path:
+                yield event.image_result(temp_path)
+                self.last_called_times[key] = time.time()
+                if self.load_to_local:
+                    asyncio.create_task(
+                        self._save_to_local_cache_async(temp_path, selected_img.get("filename"))
+                    )
+                return
+
+        yield event.plain_result("获取猪图失败，请稍后重试")
+        self.last_called_times[key] = time.time()
+
+    # ── 定时更新调度 ───────────────────────────────────────────────────────
 
     async def _update_cycle_task(self):
         try:
-            if not self.update_cycle or self.update_cycle <= 0:
-                return
-
             while True:
                 now = time.time()
-                lt = time.localtime(now)
+                lt  = time.localtime(now)
                 try:
-                    next_midnight_tuple = (lt.tm_year, lt.tm_mon, lt.tm_mday + 1, 0, 0, 0, lt.tm_wday, lt.tm_yday, lt.tm_isdst)
-                    next_midnight = time.mktime(next_midnight_tuple)
-                    sleep_seconds = max(0, int(next_midnight - now) + 1)
+                    next_mid = time.mktime((
+                        lt.tm_year, lt.tm_mon, lt.tm_mday + 1,
+                        0, 0, 0, lt.tm_wday, lt.tm_yday, lt.tm_isdst
+                    ))
+                    sleep_s = max(0, int(next_mid - now) + 1)
                 except Exception:
-                    sleep_seconds = 60
+                    sleep_s = 60
 
-                logger.info("后台更新调度：等待 %s 秒 到下一个本地零点以执行更新检查", sleep_seconds)
+                logger.info("后台更新调度：等待 %d 秒至下一个零点", sleep_s)
                 try:
-                    await asyncio.sleep(sleep_seconds)
+                    await asyncio.sleep(sleep_s)
                 except asyncio.CancelledError:
-                    logger.info("后台更新调度已被取消（等待零点期间）")
                     break
 
                 try:
-                    logger.info("后台更新调度：开始在零点检查远程列表更新")
                     remote_data = await self._fetch_remote_images()
                     if remote_data:
                         updated = self._apply_remote_data_if_needed(remote_data)
-                        if updated:
-                            logger.info("后台更新调度：检测到远程变化并已更新本地 list.json")
-                        else:
-                            logger.info("后台更新调度：远程数据与本地一致，未做更新")
+                        logger.info("后台更新：" + ("已更新" if updated else "无变化"))
                     else:
-                        logger.warning("后台更新调度：未能获取远程数据，跳过本次更新")
+                        logger.warning("后台更新：无法获取远程数据，跳过")
                 except asyncio.CancelledError:
-                    logger.info("后台更新调度已被取消（执行更新期间）")
                     break
                 except Exception as e:
-                    logger.error("后台更新调度在执行更新时发生错误（已记录）")
-                    logger.debug("后台更新出错详情：%s", e)
+                    logger.error(f"后台更新出错：{e}")
 
-                if self.update_cycle <= 1:
-                    continue
-                else:
-                    extra_days = self.update_cycle - 1
-                    extra_seconds = extra_days * 24 * 3600
-                    logger.info("后台更新调度：按周期等待额外 %d 天 (%d 秒) 再次检查", extra_days, extra_seconds)
+                if self.update_cycle > 1:
                     try:
-                        await asyncio.sleep(extra_seconds)
+                        await asyncio.sleep((self.update_cycle - 1) * 86400)
                     except asyncio.CancelledError:
-                        logger.info("后台更新调度已被取消（周期等待期间）")
                         break
         finally:
-            logger.info("后台更新调度任务退出")
+            logger.info("后台更新调度退出")
+
+    # ── 手动更新 ───────────────────────────────────────────────────────────
 
     async def _do_manual_update(self, event: AstrMessageEvent):
         async with self._update_lock:
@@ -523,52 +523,48 @@ class PigRandomImagePlugin(Star):
                 msg = "手动更新成功：本地 list.json 已更新" if updated else "手动更新完成：本地已是最新"
                 yield event.plain_result(f"[Pig] {msg}")
             except Exception as e:
-                logger.error(f"[Pig] 手动更新异常：{e}")
+                logger.error(f"手动更新异常：{e}")
                 yield event.plain_result(f"[Pig] 手动更新失败：{e}")
+
+    # ── 指令 ───────────────────────────────────────────────────────────────
 
     @filter.regex(r"(?i)^[/／]?pig(?:\s+(update|更新))?$")
     async def pig_command(self, event: AstrMessageEvent):
         """
-        /pig          — 发送随机猪图（/Pig /PIG /pIg 等均可）
-        /pig update   — 手动拉取最新图片列表
-        /pig 更新   — 同上
+        /pig        — 发送随机猪图
+        /pig update — 手动刷新图片列表
+        /pig 更新  — 同上
         """
-        raw = getattr(event, "message_str", None) or getattr(event, "message", "") or ""
+        raw   = getattr(event, "message_str", None) or getattr(event, "message", "") or ""
         clean = self._clean_text(str(raw))
-        m = re.match(r"(?i)^[/／]?pig(?:\s+(.+))?$", clean)
-        sub = m.group(1).strip().lower() if (m and m.group(1)) else None
-        is_update = sub in ("update", "更新")
-        if is_update:
+        m     = re.match(r"(?i)^[/／]?pig(?:\s+(.+))?$", clean)
+        sub   = (m.group(1) or "").strip().lower() if m else ""
+        if sub in ("update", "更新"):
             async for r in self._do_manual_update(event):
                 yield r
             return
         async for r in self._get_random_pig_image(event):
             yield r
-         
 
     @filter.event_message_type(filter.EventMessageType.GROUP_MESSAGE)
     async def keyword_trigger(self, event: AstrMessageEvent):
-        if self.is_match_all_msg:
-            message_str = event.message_str
-            if not message_str:
-                return
-            if message_str.startswith(self.exclude_prefixes):
-                return
-            if self._is_trigger_keyword(message_str, self.match_keywords):
-                async for r in self._get_random_pig_image(event):
-                    yield r
+        if not self.is_match_all_msg:
+            return
+        msg = event.message_str
+        if not msg or msg.startswith(self.exclude_prefixes):
+            return
+        if self._is_trigger_keyword(msg, self.match_keywords):
+            async for r in self._get_random_pig_image(event):
+                yield r
 
     def _is_trigger_keyword(self, message: str, keywords: list) -> bool:
-        """检查消息是否包含或等于触发关键词"""
-        # 完全匹配
         if message.strip() in keywords:
             return True
         if not self.is_exact_match:
-            # 或者消息中包含关键词
-            for keyword in keywords:
-                if keyword in message:
-                    return True
+            return any(kw in message for kw in keywords)
         return False
+
+    # ── 卸载 ───────────────────────────────────────────────────────────────
 
     async def terminate(self):
         if self._scheduler_task:
@@ -576,13 +572,10 @@ class PigRandomImagePlugin(Star):
                 self._scheduler_task.cancel()
                 try:
                     await asyncio.wait_for(self._scheduler_task, timeout=5)
-                except asyncio.TimeoutError:
-                    logger.debug("等待后台调度任务退出超时，任务可能仍在终止中")
-                except asyncio.CancelledError:
+                except (asyncio.TimeoutError, asyncio.CancelledError):
                     pass
             except Exception as e:
-                logger.debug("取消后台调度任务时发生错误：%s", e)
+                logger.debug("取消调度任务出错：%s", e)
             finally:
                 self._scheduler_task = None
-
-        logger.info("猪图插件（v0.1.4-t，支持远程更新与定时检查）已卸载")
+        logger.info("猪图插件 v0.1.5 已卸载")
