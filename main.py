@@ -13,7 +13,6 @@ from typing import Any, Dict, List, Optional, Tuple
 from astrbot.api.event import filter, AstrMessageEvent
 from astrbot.api.star import Context, Star, register
 from astrbot.api import AstrBotConfig, logger
-from astrbot.core.utils.io import download_image_by_url
 
 PIGHUB_BASE = "https://pighub.top"
 PIGHUB_API  = "https://pighub.top/api/images?sort=2&limit=10000"
@@ -26,7 +25,7 @@ _VALID_EXT = (".jpg", ".jpeg", ".png", ".gif", ".bmp", ".webp",
               ".avif", ".tiff", ".tif", ".svg", ".ico")
 
 
-@register("astrbot_plugin_pig", "SakuraMikku", "随机发送猪相关图片", "0.1.5")
+@register("astrbot_plugin_pig", "SakuraMikku", "随机发送猪相关图片", "0.1.6")
 class PigRandomImagePlugin(Star):
     def __init__(self, context: Context, config: AstrBotConfig):
         super().__init__(context, config)
@@ -76,6 +75,11 @@ class PigRandomImagePlugin(Star):
         base_dir = os.path.dirname(__file__)
         self.local_img_dir = os.path.join(base_dir, "imgs", "pig")
         self.json_path     = os.path.join(base_dir, "list.json")
+        self._tmp_dir      = os.path.join(base_dir, "imgs", "tmp")
+        try:
+            os.makedirs(self._tmp_dir, exist_ok=True)
+        except OSError:
+            self._tmp_dir = "/tmp"
 
         self._download_semaphore = asyncio.Semaphore(3)
         self._update_lock        = asyncio.Lock()
@@ -130,6 +134,192 @@ class PigRandomImagePlugin(Star):
         """从文件名中提取后缀；若无已知后缀则返回 .jpg 兜底。"""
         _, ext = os.path.splitext(filename)
         return ext.lower() if ext.lower() in _VALID_EXT else ".jpg"
+
+    # ── 图片格式转换 ───────────────────────────────────────────────────────
+    # QQ 官方机器人富媒体 API 仅支持 jpg / png / gif。
+    # 下载完成后统一用 Pillow 转换：
+    #   静态图（单帧）→ JPEG（更小体积，QQ 可靠支持）
+    #   动图（多帧）  → GIF（保留动画）
+
+    def _convert_image(self, src_path: str) -> Optional[str]:
+        """
+        将 src_path 指向的图片转换为 QQ 支持的格式后保存为新临时文件，
+        返回新文件路径；失败返回 None（调用方可继续尝试其他候选图）。
+        """
+        try:
+            from PIL import Image
+        except ImportError:
+            logger.error("[转换] Pillow 未安装，无法转换图片格式")
+            return None
+
+        try:
+            img = Image.open(src_path)
+        except Exception as e:
+            logger.warning("[转换] 无法打开图片：%s | %s", src_path, e)
+            return None
+
+        # 判断是否是动图（多帧）
+        is_animated = False
+        try:
+            n_frames = getattr(img, "n_frames", 1)
+            is_animated = n_frames > 1
+        except Exception:
+            is_animated = False
+
+        try:
+            if is_animated:
+                return self._to_gif(img, src_path)
+            else:
+                return self._to_jpeg(img, src_path)
+        finally:
+            img.close()
+
+    def _to_jpeg(self, img, src_path: str) -> Optional[str]:
+        """静态图 → JPEG。"""
+        try:
+            from PIL import Image
+            # RGBA / P 模式需先转 RGB，否则保存 JPEG 会报错
+            frame = img.convert("RGB") if img.mode not in ("RGB", "L") else img.copy()
+            dst = os.path.join(
+                self._tmp_dir,
+                f"pig_conv_{int(time.time())}_{random.randint(0, 10**9)}.jpg"
+            )
+            frame.save(dst, format="JPEG", quality=85, optimize=True)
+            frame.close()
+            logger.debug("[转换] %s → JPEG (%s)", os.path.basename(src_path), os.path.basename(dst))
+            return dst
+        except Exception as e:
+            logger.warning("[转换] 转 JPEG 失败：%s | %s", src_path, e)
+            return None
+
+    def _to_gif(self, img, src_path: str) -> Optional[str]:
+        """动图 → GIF（逐帧提取后合成）。"""
+        try:
+            from PIL import Image
+            frames: List = []
+            durations: List[int] = []
+            try:
+                while True:
+                    frame = img.copy().convert("RGBA")
+                    # GIF 调色板最多 256 色，转 P 模式时用 LANCZOS
+                    frames.append(
+                        frame.convert("P", palette=Image.ADAPTIVE, colors=256)
+                    )
+                    dur = img.info.get("duration", 100)
+                    durations.append(max(20, int(dur)))  # 最低 20ms 防止过快
+                    img.seek(img.tell() + 1)
+            except EOFError:
+                pass
+
+            if not frames:
+                return None
+
+            dst = os.path.join(
+                self._tmp_dir,
+                f"pig_conv_{int(time.time())}_{random.randint(0, 10**9)}.gif"
+            )
+            frames[0].save(
+                dst,
+                format="GIF",
+                save_all=True,
+                append_images=frames[1:],
+                loop=0,
+                duration=durations,
+                optimize=False,
+            )
+            for f in frames:
+                f.close()
+            logger.debug(
+                "[转换] %s → GIF (%d 帧, %s)",
+                os.path.basename(src_path), len(frames), os.path.basename(dst)
+            )
+            return dst
+        except Exception as e:
+            logger.warning("[转换] 转 GIF 失败：%s | %s", src_path, e)
+            return None
+
+    async def _download_image(self, url: str) -> Optional[str]:
+        """
+        用 aiohttp 下载图片（30 秒超时），下载成功后自动转换格式：
+          静态图（单帧）→ JPEG  |  动图（多帧）→ GIF
+        返回转换后的临时文件路径；失败返回 None。
+        """
+        if not self._is_valid_url(url):
+            return None
+        timeout = aiohttp.ClientTimeout(total=30)
+        raw_path = None
+        try:
+            async with aiohttp.ClientSession(timeout=timeout, trust_env=True) as sess:
+                async with sess.get(url, allow_redirects=True) as resp:
+                    ct = resp.headers.get("Content-Type", "")
+                    if resp.status != 200 or not ct.lower().startswith("image/"):
+                        try:
+                            preview = (await resp.text(errors="ignore"))[:200]
+                        except Exception:
+                            preview = ""
+                        logger.warning(
+                            "[下载] 非图片响应（%s，%s）：%s",
+                            resp.status, ct, preview
+                        )
+                        return None
+
+                    data = await resp.read()
+                    if not data:
+                        return None
+
+                    # 原始文件后缀，尽量保留给 Pillow 用于格式识别
+                    raw_ext = {
+                        "image/jpeg": ".jpg", "image/jpg": ".jpg",
+                        "image/png":  ".png", "image/gif": ".gif",
+                        "image/webp": ".webp", "image/bmp": ".bmp",
+                        "image/avif": ".avif",
+                    }.get(ct.split(";")[0].strip().lower(), ".bin")
+
+                    raw_path = os.path.join(
+                        self._tmp_dir,
+                        f"pig_raw_{int(time.time())}_{random.randint(0, 10**9)}{raw_ext}"
+                    )
+                    with open(raw_path, "wb") as f:
+                        f.write(data)
+
+        except asyncio.TimeoutError:
+            logger.warning("[下载] 超时（>30s）：%s", url[:80])
+            return None
+        except Exception as e:
+            logger.debug("[下载] 异常：%s | %s", type(e).__name__, e)
+            return None
+
+        if not raw_path or not os.path.exists(raw_path):
+            return None
+
+        # 转换格式（静态→JPEG，动图→GIF），原始文件用完即删
+        try:
+            converted = self._convert_image(raw_path)
+        finally:
+            try:
+                os.remove(raw_path)
+            except Exception:
+                pass
+
+        if not converted:
+            logger.warning("[下载] 格式转换失败，跳过此图：%s", url[:80])
+        return converted
+
+    def _cleanup_tmp(self, max_age: int = 3600):
+        """清理超过 max_age 秒的临时下载文件。"""
+        try:
+            now = time.time()
+            for fn in os.listdir(self._tmp_dir):
+                if not fn.startswith("pig_"):
+                    continue
+                fp = os.path.join(self._tmp_dir, fn)
+                try:
+                    if now - os.path.getmtime(fp) > max_age:
+                        os.remove(fp)
+                except Exception:
+                    pass
+        except Exception:
+            pass
 
     def _clean_text(self, text: str) -> str:
         if not isinstance(text, str):
@@ -316,7 +506,7 @@ class PigRandomImagePlugin(Star):
             logger.info("未启用后台自动更新（update_cycle=0）")
 
         logger.info(
-            f"猪图插件 v0.1.5 初始化完成 | "
+            f"猪图插件 v0.1.6 初始化完成 | "
             f"冷却 {self.cooldown_period}s | 本地缓存 {self.load_to_local} | "
             f"更新周期 {self.update_cycle} 天 | 已加载 {len(self.pig_images)} 张"
         )
@@ -348,11 +538,7 @@ class PigRandomImagePlugin(Star):
             return None
 
         async with self._download_semaphore:
-            try:
-                temp_path = await download_image_by_url(url)
-            except Exception as e:
-                logger.error(f"download_image_by_url 出错：{e}")
-                temp_path = None
+            temp_path = await self._download_image(url)
 
         if not temp_path or not self._is_valid_img_suffix(os.path.basename(temp_path)):
             if temp_path:
@@ -382,24 +568,14 @@ class PigRandomImagePlugin(Star):
 
         for attempt in range(1, max(1, self.max_retries) + 1):
             async with self._download_semaphore:
-                try:
-                    logger.info(f"下载尝试 {attempt}/{self.max_retries}：{title}")
-                    temp_path = await download_image_by_url(url)
-                    if not temp_path:
-                        raise RuntimeError("download returned None")
-                    if not self._is_valid_img_suffix(os.path.basename(temp_path)):
-                        try:
-                            os.remove(temp_path)
-                        except Exception:
-                            pass
-                        raise RuntimeError("非图片格式")
+                logger.info(f"[下载] 尝试 {attempt}/{self.max_retries}：{title}")
+                temp_path = await self._download_image(url)
+                if temp_path:
                     return temp_path
-                except Exception as e:
-                    logger.debug(f"下载尝试 {attempt}/{self.max_retries} 失败：{str(e)[:120]}")
-                    if attempt >= max(1, self.max_retries):
-                        logger.error(f"获取 {title} 失败（共 {attempt} 次）")
-                        return None
-                    await asyncio.sleep(min(2.0, 1.5 ** attempt))
+            if attempt < max(1, self.max_retries):
+                await asyncio.sleep(min(2.0, 1.5 ** attempt))
+
+        logger.error(f"[下载] 获取 {title} 失败（共 {self.max_retries} 次）")
         return None
 
     async def _save_to_local_cache_async(self, downloaded_path: str, target_filename: str):
@@ -434,6 +610,7 @@ class PigRandomImagePlugin(Star):
 
         tried: set = set()
         max_candidates = min(len(self.pig_images), 3)
+        self._cleanup_tmp()
         for _ in range(max_candidates):
             idx = random.randrange(len(self.pig_images))
             if idx in tried and len(tried) < len(self.pig_images):
@@ -578,4 +755,4 @@ class PigRandomImagePlugin(Star):
                 logger.debug("取消调度任务出错：%s", e)
             finally:
                 self._scheduler_task = None
-        logger.info("猪图插件 v0.1.5 已卸载")
+        logger.info("猪图插件 v0.1.6 已卸载")
